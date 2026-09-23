@@ -36,8 +36,8 @@ import matplotlib.pyplot as plt
 # ============================================================
 #  SETTINGS  (sirf ye 2 lines badalni hain)
 # ============================================================
-BOT_TOKEN = "8954226044:AAFv9RThMlKxQjoUCU84wM6yWwP1EF4Wfac"   # <-- baad mein yahan asli token paste karna (quotes " " ke andar)
-CHAT_ID = "@Strexx_Crypto_Signals"   # <-- aap ka channel
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "YAHAN_APNA_BOT_TOKEN_LIKHO"   # PC/VPS par yahan token likho. GitHub par KABHI mat likho (Secrets use hota hai)
+CHAT_ID = os.getenv("CHAT_ID") or "@Strexx_Crypto_Signals"   # aap ka channel
 
 # ---- Advanced settings (chaho to chhor do) ----
 TOP_N = 50               # kitne top coins (24h volume ke hisaab se)
@@ -84,14 +84,14 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-def send_telegram(text):
+def send_telegram(text, parse_mode="HTML"):
     if BOT_TOKEN.startswith("YAHAN"):
         print("\n[DRY RUN - token set nahi hai, sirf screen par dikha raha hun]\n" + text + "\n")
         return True
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
+            data={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode},
             timeout=15,
         )
         if not r.ok:
@@ -154,7 +154,7 @@ def fmt_price(p):
     return f"{p:.{decimals}f}"
 
 
-def send_telegram_photo(path, caption):
+def send_telegram_photo(path, caption, parse_mode="HTML"):
     if BOT_TOKEN.startswith("YAHAN"):
         print(f"\n[DRY RUN - photo] {caption}\n")
         return True
@@ -162,7 +162,7 @@ def send_telegram_photo(path, caption):
         with open(path, "rb") as f:
             r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={"chat_id": CHAT_ID, "caption": caption},
+                data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": parse_mode},
                 files={"photo": f},
                 timeout=30,
             )
@@ -198,6 +198,34 @@ def make_chart(symbol, title):
     fig.savefig(CHART_FILE, facecolor="#0d0d0d")
     plt.close(fig)
     return CHART_FILE
+
+
+def _text_card(header, body, bg_color, footer="STREXX CRYPTO SIGNALS", wrap=42):
+    """Colorful card image banata hai (tips/news ke liye), text ke saath."""
+    import textwrap
+    wrapped = "\n".join(textwrap.wrap(body, width=wrap))
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=130)
+    fig.patch.set_facecolor(bg_color)
+    ax.set_facecolor(bg_color)
+    ax.axis("off")
+    ax.text(0.5, 0.90, header.upper(), ha="center", va="top", fontsize=21,
+             fontweight="bold", color="white", transform=ax.transAxes)
+    ax.text(0.5, 0.72, wrapped, ha="center", va="top", fontsize=14.5,
+             color="#f5f5f5", linespacing=1.7, transform=ax.transAxes)
+    ax.text(0.5, 0.05, footer, ha="center", va="bottom", fontsize=9.5,
+             color="#dddddd", alpha=0.85, transform=ax.transAxes)
+    fig.savefig(CHART_FILE, facecolor=bg_color)
+    plt.close(fig)
+    return CHART_FILE
+
+
+def make_tip_card(label, color, body_text):
+    return _text_card(label, body_text, color)
+
+
+def make_news_card(headline):
+    return _text_card("Crypto News", headline, "#7c2d12", wrap=36)
 
 
 # ============================================================
@@ -316,24 +344,24 @@ def analyze(symbol, btc_trend):
 
 
 def signal_message(s):
-    icon = "🟢" if s["side"] == "LONG" else "🔴"
+    icon = "🟢🚀" if s["side"] == "LONG" else "🔴📉"
     name = s["symbol"][:-4] + "/USDT"
 
     def pct(x):
         return f"{(x - s['entry']) / s['entry'] * 100:+.2f}%"
 
     return (
-        f"{icon} {s['side']} SIGNAL | {name}\n"
-        f"Timeframe: 1H (4H trend confirmed)\n\n"
-        f"Entry: {fmt_price(s['entry'])}\n"
-        f"Stop Loss: {fmt_price(s['sl'])} ({pct(s['sl'])})\n"
-        f"TP1: {fmt_price(s['tp1'])} ({pct(s['tp1'])})\n"
-        f"TP2: {fmt_price(s['tp2'])} ({pct(s['tp2'])})\n\n"
-        f"Risk:Reward = 1:{TP1_RR:g} / 1:{TP2_RR:g}\n"
-        f"Strength: {s['score']}/4\n\n"
-        f"Tip: TP1 par half profit lo aur SL entry par le aao.\n"
-        f"Risk sirf 1-2% per trade, leverage kam rakho.\n"
-        f"⚠️ Not financial advice."
+        f"<b>{icon} {s['side']} SIGNAL — {name}</b>\n"
+        f"⏱ 1H entry (4H trend confirmed)\n\n"
+        f"📍 <b>Entry:</b> {fmt_price(s['entry'])}\n"
+        f"🛑 <b>Stop Loss:</b> {fmt_price(s['sl'])} <i>({pct(s['sl'])})</i>\n"
+        f"🎯 <b>TP1:</b> {fmt_price(s['tp1'])} <i>({pct(s['tp1'])})</i>\n"
+        f"🎯 <b>TP2:</b> {fmt_price(s['tp2'])} <i>({pct(s['tp2'])})</i>\n\n"
+        f"⚖️ <b>Risk:Reward:</b> 1:{TP1_RR:g} / 1:{TP2_RR:g}\n"
+        f"💪 <b>Strength:</b> {s['score']}/4\n\n"
+        f"💡 TP1 par half profit lo, phir SL ko entry par le aao.\n"
+        f"⚠️ Risk sirf 1-2% per trade, leverage kam rakho.\n\n"
+        f"<i>Not financial advice.</i>"
     )
 
 
@@ -653,6 +681,22 @@ CONTENT_SEQUENCE = [
     "news", "risk", "summary",
 ]
 
+TIP_STYLES = {
+    "education": {"emoji": "📚", "label": "Education Tip", "color": "#1d3557", "pool": EDUCATION_TIPS},
+    "psychology": {"emoji": "🧠", "label": "Psychology Tip", "color": "#5b21b6", "pool": PSYCHOLOGY_TIPS},
+    "risk": {"emoji": "⚠️", "label": "Risk Management Tip", "color": "#9a1b1b", "pool": RISK_TIPS},
+}
+
+
+def post_tip(data, category):
+    style = TIP_STYLES[category]
+    i = next_from_bag(data, category, len(style["pool"]))
+    tip = style["pool"][i]
+    body = tip.split(" ", 1)[1] if " " in tip else tip  # emoji prefix hata do
+    img = make_tip_card(style["label"], style["color"], body)
+    caption = f"<b>{style['emoji']} {style['label']}</b>\n\n{body}\n\n<i>Strexx Crypto Signals</i>"
+    send_telegram_photo(img, caption)
+
 
 def next_from_bag(data, category, pool_len):
     """Har category ki tips bina repeat kiye baari baari deta hai (poori list khatam hone tak)."""
@@ -679,11 +723,11 @@ def post_market_overview():
         fng_val = fng["data"][0]["value"]
         fng_label = fng["data"][0]["value_classification"]
         text = (
-            "🔥 Market Overview\n\n"
-            f"BTC: ${btc['usd']:,.0f} ({btc['usd_24h_change']:+.2f}% 24h)\n"
-            f"ETH: ${eth['usd']:,.0f} ({eth['usd_24h_change']:+.2f}% 24h)\n"
-            f"Fear & Greed Index: {fng_val} ({fng_label})\n\n"
-            "⚠️ Not financial advice."
+            "<b>🔥 Market Overview</b>\n\n"
+            f"₿ <b>BTC:</b> ${btc['usd']:,.0f}  <i>({btc['usd_24h_change']:+.2f}% 24h)</i>\n"
+            f"Ξ <b>ETH:</b> ${eth['usd']:,.0f}  <i>({eth['usd_24h_change']:+.2f}% 24h)</i>\n"
+            f"😨 <b>Fear &amp; Greed:</b> {fng_val} ({fng_label})\n\n"
+            "<i>Not financial advice.</i>"
         )
         path = make_chart("BTCUSDT", "BTC/USDT - 1H")
         send_telegram_photo(path, text)
@@ -706,12 +750,12 @@ def post_technical_analysis():
         resistance = df["high"].tail(30).max()
         name = symbol[:-4] + "/USDT"
         text = (
-            f"📊 Technical Analysis — {name}\n\n"
-            f"RSI(14): {rsi_val:.1f} ({rsi_tag})\n"
-            f"MACD: {macd_tag}\n"
-            f"Support: {fmt_price(support)}\n"
-            f"Resistance: {fmt_price(resistance)}\n\n"
-            "⚠️ Not financial advice."
+            f"<b>📊 Technical Analysis — {name}</b>\n\n"
+            f"📈 <b>RSI(14):</b> {rsi_val:.1f}  <i>({rsi_tag})</i>\n"
+            f"📉 <b>MACD:</b> {macd_tag}\n"
+            f"🟢 <b>Support:</b> {fmt_price(support)}\n"
+            f"🔴 <b>Resistance:</b> {fmt_price(resistance)}\n\n"
+            "<i>Not financial advice.</i>"
         )
         path = make_chart(symbol, f"{name} - 1H")
         send_telegram_photo(path, text)
@@ -731,12 +775,12 @@ def post_coin_analysis():
         chg = (c.iloc[-1] - c.iloc[-25]) / c.iloc[-25] * 100
         name = symbol[:-4] + "/USDT"
         text = (
-            f"🔍 Coin Analysis — {name}\n\n"
-            f"4H Trend: {side}\n"
-            f"24h Change: {chg:+.2f}%\n"
-            f"RSI(14): {r:.1f}\n"
-            f"Price: {fmt_price(c.iloc[-1])}\n\n"
-            "⚠️ Not financial advice."
+            f"<b>🔍 Coin Analysis — {name}</b>\n\n"
+            f"📊 <b>4H Trend:</b> {side}\n"
+            f"⏱ <b>24h Change:</b> {chg:+.2f}%\n"
+            f"📈 <b>RSI(14):</b> {r:.1f}\n"
+            f"💰 <b>Price:</b> {fmt_price(c.iloc[-1])}\n\n"
+            "<i>Not financial advice.</i>"
         )
         path = make_chart(symbol, f"{name} - 1H")
         send_telegram_photo(path, text)
@@ -753,7 +797,9 @@ def post_news(data):
             title = item.findtext("title", "").strip()
             link = item.findtext("link", "").strip()
             if title and title not in posted:
-                send_telegram(f"📰 Crypto News\n\n{title}\n\n{link}")
+                img = make_news_card(title)
+                caption = f"<b>📰 Crypto News</b>\n\n{title}\n\n🔗 {link}"
+                send_telegram_photo(img, caption)
                 posted.add(title)
                 data["posted_news"] = list(posted)[-100:]
                 return
@@ -768,10 +814,10 @@ def post_daily_summary(data):
         stats = data["stats"]
         title = "🌙 Weekly Market Recap" if is_weekly else "📋 Daily Market Summary"
         text = (
-            f"{title}\n\n"
-            f"Open signals: {len(data['open'])}\n"
+            f"<b>{title}</b>\n\n"
+            f"📂 Open signals: {len(data['open'])}\n"
             f"{stats_line(stats)}\n\n"
-            "⚠️ Not financial advice."
+            "<i>Not financial advice.</i>"
         )
         path = make_chart("BTCUSDT", "BTC/USDT - 1H")
         send_telegram_photo(path, text)
@@ -796,14 +842,11 @@ def post_content(data):
         elif kind == "summary":
             post_daily_summary(data)
         elif kind == "education":
-            i = next_from_bag(data, "education", len(EDUCATION_TIPS))
-            send_telegram(EDUCATION_TIPS[i])
+            post_tip(data, "education")
         elif kind == "psychology":
-            i = next_from_bag(data, "psychology", len(PSYCHOLOGY_TIPS))
-            send_telegram(PSYCHOLOGY_TIPS[i])
+            post_tip(data, "psychology")
         elif kind == "risk":
-            i = next_from_bag(data, "risk", len(RISK_TIPS))
-            send_telegram(RISK_TIPS[i])
+            post_tip(data, "risk")
     except Exception as e:
         log(f"Content post error ({kind}): {e}")
 
@@ -900,7 +943,7 @@ def evaluate(s):
 def stats_line(stats):
     total = stats["wins"] + stats["losses"]
     rate = (stats["wins"] / total * 100) if total else 0
-    return f"Record: {stats['wins']}W / {stats['losses']}L  ({rate:.0f}% win rate)"
+    return f"📊 <b>Record:</b> {stats['wins']}W / {stats['losses']}L  ({rate:.0f}% win rate)"
 
 
 def check_open_signals(data):
@@ -919,26 +962,38 @@ def check_open_signals(data):
         elif state == "tp1":
             if not s.get("tp1_notified"):
                 s["tp1_notified"] = True
-                send_telegram(f"🎯 {name} {s['side']}: TP1 hit ✅\nAb SL entry ({fmt_price(s['entry'])}) par le aao. Risk-free trade.")
+                text = (
+                    f"<b>🎯 TP1 HIT — {name} {s['side']}</b>\n\n"
+                    f"Ab SL <b>entry ({fmt_price(s['entry'])})</b> par le aao. Risk-free trade! 🛡️"
+                )
+                img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#166534", wrap=36)
+                send_telegram_photo(img, text)
             still_open.append(s)
         else:
             if state == "sl":
                 data["stats"]["losses"] += 1
-                text = f"❌ {name} {s['side']}: Stop Loss hit"
+                header, color = "Stop Loss Hit", "#7f1d1d"
+                text = f"<b>❌ {header} — {name} {s['side']}</b>"
             elif state == "tp2":
                 data["stats"]["wins"] += 1
-                text = f"🏆 {name} {s['side']}: TP2 hit ✅✅ (full target)"
+                header, color = "TP2 Hit - Full Target", "#166534"
+                text = f"<b>🏆 {header} — {name} {s['side']}</b> ✅✅"
             elif state == "be":
                 data["stats"]["wins"] += 1
-                text = f"✅ {name} {s['side']}: TP1 mila, phir entry par band (breakeven)"
+                header, color = "Closed at Breakeven", "#1e3a5f"
+                text = f"<b>✅ {header} — {name} {s['side']}</b>\nTP1 mil chuka tha, phir entry par band."
             elif state == "tp1_close":
                 data["stats"]["wins"] += 1
-                text = f"✅ {name} {s['side']}: TP1 hit, trade time-out par band"
+                header, color = "Closed after TP1", "#1e3a5f"
+                text = f"<b>✅ {header} — {name} {s['side']}</b>\nTime-out par band hua."
             else:  # expired
                 data["stats"]["expired"] += 1
-                text = f"⏱ {name} {s['side']}: {EXPIRE_H}h mein koi target nahi mila, signal band"
+                header, color = "Signal Expired", "#525252"
+                text = f"<b>⏱ {header} — {name} {s['side']}</b>\n{EXPIRE_H}h mein koi target nahi mila."
             log_result(s, state)
-            send_telegram(text + "\n" + stats_line(data["stats"]))
+            full_text = text + "\n\n" + stats_line(data["stats"])
+            img = _text_card(header, f"{name} {s['side']}", color, wrap=36)
+            send_telegram_photo(img, full_text)
         time.sleep(0.2)
     data["open"] = still_open
 
@@ -978,7 +1033,13 @@ def scan_for_signals(data):
     found.sort(key=lambda x: -x["rank"])
     sent = 0
     for sig in found[:MAX_SIGNALS_PER_SCAN]:
-        if send_telegram(signal_message(sig)):
+        try:
+            path = make_chart(sig["symbol"], f"{sig['symbol'][:-4]}/USDT - Entry Signal")
+            ok = send_telegram_photo(path, signal_message(sig))
+        except Exception as e:
+            log(f"Chart error {sig['symbol']}: {e}")
+            ok = send_telegram(signal_message(sig))
+        if ok:
             data["open"].append(sig)
             data["last_sent"][sig["symbol"]] = now
             sent += 1
