@@ -49,7 +49,7 @@ TP2_RR = 3.0             # TP2 = 3 x risk
 MIN_SCORE = 3            # 4 mein se kam az kam 3 conditions match hon
 VOL_MULT = 1.2           # volume average se 1.2x zyada
 MIN_ATR_PCT = 0.25       # bohat sust (flat) coins skip
-BTC_FILTER = True        # BTC ke khilaf altcoin signal nahi
+BTC_FILTER = False       # true karne se sirf BTC ke trend ki taraf ke signals aatay hain
 COOLDOWN_H = 8           # same coin par dobara signal 8 ghante baad
 MAX_SIGNALS_PER_SCAN = 3 # ek scan mein max signals (sab se strong)
 EXPIRE_H = 48            # 48 ghante mein kuch na hua to signal band
