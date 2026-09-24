@@ -200,21 +200,72 @@ def make_chart(symbol, title):
     return CHART_FILE
 
 
-def _text_card(header, body, bg_color, footer="STREXX CRYPTO SIGNALS", wrap=42):
-    """Colorful card image banata hai (tips/news ke liye), text ke saath."""
+def _darken(hex_color, factor=0.45):
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return (r / 255 * factor, g / 255 * factor, b / 255 * factor)
+
+
+def _hex_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return (r / 255, g / 255, b / 255)
+
+
+def _badge(ax, kind, cx=0.5, cy=0.84):
+    """Bara check/cross/dash badge banata hai (win=green, loss=red, neutral=grey)."""
+    from matplotlib.patches import Ellipse
+    colors = {"win": "#22c55e", "loss": "#ef4444", "neutral": "#94a3b8"}
+    face = colors.get(kind, colors["neutral"])
+    ew, eh = 0.16, 0.16 * (8 / 4.5)
+    ax.add_patch(Ellipse((cx, cy), ew, eh, facecolor=face, edgecolor="white", linewidth=2.5, zorder=5))
+    if kind == "win":
+        ax.plot([cx - 0.045, cx - 0.01, cx + 0.055], [cy - 0.01, cy - 0.065, cy + 0.075],
+                 color="white", linewidth=5, zorder=6, solid_capstyle="round")
+    elif kind == "loss":
+        d = 0.05
+        ax.plot([cx - d, cx + d], [cy - d * 1.78, cy + d * 1.78], color="white", linewidth=5, zorder=6, solid_capstyle="round")
+        ax.plot([cx - d, cx + d], [cy + d * 1.78, cy - d * 1.78], color="white", linewidth=5, zorder=6, solid_capstyle="round")
+    else:
+        ax.plot([cx - 0.055, cx + 0.055], [cy, cy], color="white", linewidth=5, zorder=6, solid_capstyle="round")
+
+
+def _text_card(header, body, bg_color, footer="STREXX CRYPTO SIGNALS", wrap=42, badge=None):
+    """Gradient + decorative colorful card image banata hai (tips/news/results ke liye)."""
     import textwrap
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import Ellipse
+
     wrapped = "\n".join(textwrap.wrap(body, width=wrap))
-    plt.style.use("dark_background")
+    top_c = _hex_rgb(bg_color)
+    bottom_c = _darken(bg_color, 0.35)
+    cmap = LinearSegmentedColormap.from_list("grad", [bottom_c, top_c])
+    grad = np.linspace(0, 1, 256).reshape(256, 1)
+
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=130)
-    fig.patch.set_facecolor(bg_color)
-    ax.set_facecolor(bg_color)
+    ax.imshow(grad, aspect="auto", cmap=cmap, extent=[0, 1, 0, 1], origin="lower", zorder=0)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.text(0.5, 0.90, header.upper(), ha="center", va="top", fontsize=21,
-             fontweight="bold", color="white", transform=ax.transAxes)
-    ax.text(0.5, 0.72, wrapped, ha="center", va="top", fontsize=14.5,
-             color="#f5f5f5", linespacing=1.7, transform=ax.transAxes)
-    ax.text(0.5, 0.05, footer, ha="center", va="bottom", fontsize=9.5,
-             color="#dddddd", alpha=0.85, transform=ax.transAxes)
+
+    # decorative soft circles for depth
+    ax.add_patch(Ellipse((0.9, 0.88), 0.5, 0.9, facecolor="white", alpha=0.05, zorder=1))
+    ax.add_patch(Ellipse((0.05, 0.05), 0.4, 0.7, facecolor="white", alpha=0.05, zorder=1))
+
+    header_y = 0.90
+    body_y = 0.72
+    if badge:
+        _badge(ax, badge, cy=0.90)
+        header_y = 0.68
+        body_y = 0.50
+
+    ax.text(0.5, header_y, header.upper(), ha="center", va="top", fontsize=20,
+             fontweight="bold", color="white", transform=ax.transAxes, zorder=6)
+    ax.text(0.5, body_y, wrapped, ha="center", va="top", fontsize=14.5,
+             color="#f5f5f5", linespacing=1.7, transform=ax.transAxes, zorder=6)
+    ax.text(0.5, 0.04, footer, ha="center", va="bottom", fontsize=9.5,
+             color="#dddddd", alpha=0.85, transform=ax.transAxes, zorder=6)
     fig.savefig(CHART_FILE, facecolor=bg_color)
     plt.close(fig)
     return CHART_FILE
@@ -225,7 +276,7 @@ def make_tip_card(label, color, body_text):
 
 
 def make_news_card(headline):
-    return _text_card("Crypto News", headline, "#7c2d12", wrap=36)
+    return _text_card("Crypto News", headline, "#0f766e", wrap=36)
 
 
 # ============================================================
@@ -684,7 +735,7 @@ CONTENT_SEQUENCE = [
 TIP_STYLES = {
     "education": {"emoji": "📚", "label": "Education Tip", "color": "#1d3557", "pool": EDUCATION_TIPS},
     "psychology": {"emoji": "🧠", "label": "Psychology Tip", "color": "#5b21b6", "pool": PSYCHOLOGY_TIPS},
-    "risk": {"emoji": "⚠️", "label": "Risk Management Tip", "color": "#9a1b1b", "pool": RISK_TIPS},
+    "risk": {"emoji": "⚠️", "label": "Risk Management Tip", "color": "#b45309", "pool": RISK_TIPS},
 }
 
 
@@ -966,33 +1017,33 @@ def check_open_signals(data):
                     f"<b>🎯 TP1 HIT — {name} {s['side']}</b>\n\n"
                     f"Ab SL <b>entry ({fmt_price(s['entry'])})</b> par le aao. Risk-free trade! 🛡️"
                 )
-                img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#166534", wrap=36)
+                img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#15803d", wrap=36, badge="win")
                 send_telegram_photo(img, text)
             still_open.append(s)
         else:
             if state == "sl":
                 data["stats"]["losses"] += 1
-                header, color = "Stop Loss Hit", "#7f1d1d"
+                header, color, badge = "Stop Loss Hit", "#7f1d1d", "loss"
                 text = f"<b>❌ {header} — {name} {s['side']}</b>"
             elif state == "tp2":
                 data["stats"]["wins"] += 1
-                header, color = "TP2 Hit - Full Target", "#166534"
+                header, color, badge = "TP2 Hit - Full Target", "#166534", "win"
                 text = f"<b>🏆 {header} — {name} {s['side']}</b> ✅✅"
             elif state == "be":
                 data["stats"]["wins"] += 1
-                header, color = "Closed at Breakeven", "#1e3a5f"
+                header, color, badge = "Closed at Breakeven", "#14532d", "win"
                 text = f"<b>✅ {header} — {name} {s['side']}</b>\nTP1 mil chuka tha, phir entry par band."
             elif state == "tp1_close":
                 data["stats"]["wins"] += 1
-                header, color = "Closed after TP1", "#1e3a5f"
+                header, color, badge = "Closed after TP1", "#166534", "win"
                 text = f"<b>✅ {header} — {name} {s['side']}</b>\nTime-out par band hua."
             else:  # expired
                 data["stats"]["expired"] += 1
-                header, color = "Signal Expired", "#525252"
+                header, color, badge = "Signal Expired", "#334155", "neutral"
                 text = f"<b>⏱ {header} — {name} {s['side']}</b>\n{EXPIRE_H}h mein koi target nahi mila."
             log_result(s, state)
             full_text = text + "\n\n" + stats_line(data["stats"])
-            img = _text_card(header, f"{name} {s['side']}", color, wrap=36)
+            img = _text_card(header, f"{name} {s['side']}", color, wrap=36, badge=badge)
             send_telegram_photo(img, full_text)
         time.sleep(0.2)
     data["open"] = still_open
