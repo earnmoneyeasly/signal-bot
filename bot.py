@@ -307,8 +307,13 @@ def atr(df, n=14):
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
+def vwap(df):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    return (tp * df["volume"]).cumsum() / df["volume"].cumsum()
+
+
 def trend_of(df4):
-    """4H trend: LONG / SHORT / None"""
+    """4H EMA trend: LONG / SHORT / None"""
     if len(df4) < 210:
         return None
     c = df4["close"]
@@ -323,73 +328,214 @@ def trend_of(df4):
 
 
 # ============================================================
-#  SIGNAL LOGIC
+#  SMART MONEY CONCEPTS (SMC) STRATEGY ENGINE
+#  1) Market Regime   2) Multi-Timeframe (4H/1H/15M/5M)
+#  3) Liquidity (Sweep/BOS/CHOCH)   4) Volume + VWAP
+#  5) Smart Entry (FVG/Order Block/Retest)
+#  6) Quant Filters (ATR, min R:R)   7) Score 0-100
 # ============================================================
 
+MIN_SIGNAL_SCORE = 70   # 100 mein se, sirf isse zyada score wale signals post hote hain
+SWING_L = 2              # swing high/low detect karne ke liye left/right bars
+SWING_R = 2
+VOL_LOOKBACK = 100        # kitni purani candles se "normal" volatility nikalni hai
+VOL_PCTL_MAX = 0.85       # is percentile se upar ATR% ho to "high volatility" mana jata hai
 
-def analyze(symbol, btc_trend):
-    # 1) 4H trend
-    df4 = get_klines(symbol, TREND_TF, 300).iloc[:-1]  # aakhri (adhoori) candle hata do
-    side = trend_of(df4)
-    if side is None:
-        return None
-    if BTC_FILTER and symbol != "BTCUSDT" and btc_trend is not None and btc_trend != side:
-        return None
 
-    # 2) 1H entry
-    df = get_klines(symbol, ENTRY_TF, 300).iloc[:-1]
-    if len(df) < 60:
-        return None
+def find_swings(df, left=SWING_L, right=SWING_R):
+    """Fractal swing highs/lows dhundta hai. Return: list of (index, price)."""
+    highs, lows = df["high"].values, df["low"].values
+    n = len(df)
+    sh, sl = [], []
+    for i in range(left, n - right):
+        window_h = highs[i - left:i + right + 1]
+        window_l = lows[i - left:i + right + 1]
+        if highs[i] == window_h.max():
+            sh.append((i, highs[i]))
+        if lows[i] == window_l.min():
+            sl.append((i, lows[i]))
+    return sh, sl
 
-    c = df["close"]
-    ema20 = ema(c, 20)
-    r = rsi(c)
-    macd_line = ema(c, 12) - ema(c, 26)
-    hist = macd_line - ema(macd_line, 9)
-    a = atr(df)
-    vol_ratio = df["volume"] / df["volume"].rolling(20).mean()
 
-    price = float(c.iloc[-1])
-    a_now = float(a.iloc[-1])
-    if a_now / price * 100 < MIN_ATR_PCT:
-        return None
+def market_regime(df4):
+    """1) Market Regime: Bull/Bear/Sideways + high-volatility restriction."""
+    if len(df4) < 210:
+        return None, "unknown"
+    bias = trend_of(df4)
+    a = atr(df4)
+    atr_pct = (a / df4["close"]) * 100
+    recent = atr_pct.tail(VOL_LOOKBACK)
+    if len(recent) < 20:
+        return bias, "normal"
+    rank = (recent < recent.iloc[-1]).mean()  # current ATR% ka percentile
+    vol_state = "high" if rank >= VOL_PCTL_MAX else "normal"
+    return bias, vol_state
 
-    if side == "LONG":
-        checks = {
-            "MACD": hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2],
-            "RSI": 45 <= r.iloc[-1] <= 65 and r.iloc[-1] > r.iloc[-2],
-            "Volume": vol_ratio.iloc[-1] >= VOL_MULT,
-            "EMA20": price > ema20.iloc[-1] and (price - ema20.iloc[-1]) <= 1.5 * a_now,
-        }
+
+def structure_check(df1h, bias):
+    """2)+3) 1H market structure: BOS (continuation) vs CHOCH (reversal warning)."""
+    sh, sl = find_swings(df1h)
+    if len(sh) < 2 or len(sl) < 2:
+        return False, False
+    price = df1h["close"].iloc[-1]
+    last_sh = sh[-1][1]
+    last_sl = sl[-1][1]
+    prev_sh = sh[-2][1]
+    prev_sl = sl[-2][1]
+
+    if bias == "LONG":
+        bos = price > last_sh                          # naya high break -> uptrend continuation
+        higher_structure = last_sh > prev_sh and last_sl > prev_sl   # HH + HL
+        choch = price < last_sl                         # trend ke khilaf swing low toot gaya
+        return (bos or higher_structure), choch
     else:
-        checks = {
-            "MACD": hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2],
-            "RSI": 35 <= r.iloc[-1] <= 55 and r.iloc[-1] < r.iloc[-2],
-            "Volume": vol_ratio.iloc[-1] >= VOL_MULT,
-            "EMA20": price < ema20.iloc[-1] and (ema20.iloc[-1] - price) <= 1.5 * a_now,
-        }
+        bos = price < last_sl
+        lower_structure = last_sh < prev_sh and last_sl < prev_sl    # LH + LL
+        choch = price > last_sh
+        return (bos or lower_structure), choch
 
-    score = sum(1 for v in checks.values() if bool(v))
-    if score < MIN_SCORE:
+
+def liquidity_sweep(df15, bias):
+    """3) Liquidity sweep: wick stop-hunt ke baad price wapas andar close ho."""
+    sh, sl = find_swings(df15)
+    if not sh or not sl:
+        return False
+    recent = df15.tail(6)
+    if bias == "LONG":
+        level = sl[-1][1]
+        return bool(((recent["low"] < level) & (recent["close"] > level)).any())
+    else:
+        level = sh[-1][1]
+        return bool(((recent["high"] > level) & (recent["close"] < level)).any())
+
+
+def find_zone(df15, bias):
+    """5) FVG (Fair Value Gap) ya Order Block zone dhundta hai, aur check karta hai
+    price abhi us zone ke andar/qareeb hai ya nahi (retest)."""
+    highs, lows, opens, closes = df15["high"].values, df15["low"].values, df15["open"].values, df15["close"].values
+    n = len(df15)
+    price = closes[-1]
+    zone = None
+    # FVG: 3-candle imbalance, last 25 candles mein dhundo (sab se recent zone use karo)
+    for i in range(n - 3, max(n - 26, 2), -1):
+        if bias == "LONG" and lows[i + 1] > highs[i - 1]:
+            zone = (highs[i - 1], lows[i + 1])
+            break
+        if bias == "SHORT" and highs[i + 1] < lows[i - 1]:
+            zone = (highs[i + 1], lows[i - 1])
+            break
+    if zone is None:
+        # Order Block fallback: BOS candle se pehle wali ulti-rang candle
+        for i in range(n - 2, max(n - 26, 1), -1):
+            if bias == "LONG" and closes[i] < opens[i] and closes[i + 1] > opens[i + 1]:
+                zone = (lows[i], highs[i])
+                break
+            if bias == "SHORT" and closes[i] > opens[i] and closes[i + 1] < opens[i + 1]:
+                zone = (lows[i], highs[i])
+                break
+    if zone is None:
+        return False
+    lo, hi = min(zone), max(zone)
+    pad = (hi - lo) * 0.5
+    return (lo - pad) <= price <= (hi + pad)
+
+
+def entry_confirmation(df5, bias):
+    """4) 5M entry confirmation: strong-body candle + volume anomaly (order-flow proxy)."""
+    if len(df5) < 25:
+        return False
+    last = df5.iloc[-1]
+    rng = last["high"] - last["low"]
+    if rng <= 0:
+        return False
+    body = abs(last["close"] - last["open"])
+    body_ratio = body / rng
+    vol_ratio = last["volume"] / df5["volume"].rolling(20).mean().iloc[-1]
+    if bias == "LONG":
+        direction_ok = last["close"] > last["open"]
+    else:
+        direction_ok = last["close"] < last["open"]
+    return bool(direction_ok and body_ratio >= 0.45 and vol_ratio >= VOL_MULT)
+
+
+def vwap_check(df, bias):
+    """4) VWAP ke sahi side par price honi chahiye (order-flow proxy, CVD data free mein nahi milta)."""
+    v = vwap(df)
+    price = df["close"].iloc[-1]
+    return bool(price > v.iloc[-1]) if bias == "LONG" else bool(price < v.iloc[-1])
+
+
+def analyze(symbol):
+    # ---- 1) Market Regime (4H) ----
+    df4 = get_klines(symbol, "4h", 300).iloc[:-1]
+    bias, vol_state = market_regime(df4)
+    if bias is None:
+        return None
+    if vol_state == "high":
+        return None  # high-volatility market mein signals restrict
+
+    # ---- 2) Multi-timeframe data ----
+    df1h = get_klines(symbol, "1h", 300).iloc[:-1]
+    df15 = get_klines(symbol, "15m", 300).iloc[:-1]
+    df5 = get_klines(symbol, "5m", 200).iloc[:-1]
+    if len(df1h) < 60 or len(df15) < 60 or len(df5) < 30:
         return None
 
+    price = float(df15["close"].iloc[-1])
+    a15 = atr(df15)
+    a_now = float(a15.iloc[-1])
+    if a_now / price * 100 < MIN_ATR_PCT:
+        return None  # market bohat flat/dead hai
+
+    # ---- score components ----
+    bos_ok, choch = structure_check(df1h, bias)
+    sweep_ok = liquidity_sweep(df15, bias)
+    zone_ok = find_zone(df15, bias)
+    entry_ok = entry_confirmation(df5, bias)
+    vwap_ok = vwap_check(df15, bias)
+
+    if choch:
+        return None  # CHOCH = trend ulat raha hai, is coin ko skip karo
+
+    weights = {
+        "trend": 20,       # 4H regime clear hai
+        "structure": 20,   # 1H BOS / higher structure
+        "sweep": 15,       # liquidity sweep mila
+        "zone": 15,        # FVG/Order Block retest zone ke andar
+        "entry": 20,       # 5M entry confirmation candle + volume
+        "vwap": 10,        # VWAP ke sahi side
+    }
+    hits = {
+        "trend": True,
+        "structure": bos_ok,
+        "sweep": sweep_ok,
+        "zone": zone_ok,
+        "entry": entry_ok,
+        "vwap": vwap_ok,
+    }
+    score = sum(weights[k] for k, ok in hits.items() if ok)
+    if score < MIN_SIGNAL_SCORE:
+        return None
+    if not entry_ok:
+        return None  # entry confirmation ke bagair kabhi bhi post na karo
+
+    # ---- Quant filter: SL/TP via ATR, min Risk:Reward already TP1_RR/TP2_RR ----
     risk = SL_ATR_MULT * a_now
-    if side == "LONG":
+    if bias == "LONG":
         sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
     else:
         sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
 
-    vr = float(vol_ratio.iloc[-1])
     return {
         "symbol": symbol,
-        "side": side,
+        "side": bias,
         "entry": price,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "score": score,
-        "rank": score + min(vr, 3) / 10,
-        "rsi": float(r.iloc[-1]),
+        "rank": score,
+        "tags": [k for k, ok in hits.items() if ok],
         "time": int(time.time() * 1000),
     }
 
@@ -397,19 +543,25 @@ def analyze(symbol, btc_trend):
 def signal_message(s):
     icon = "🟢🚀" if s["side"] == "LONG" else "🔴📉"
     name = s["symbol"][:-4] + "/USDT"
+    tag_map = {
+        "trend": "4H Trend", "structure": "1H BOS/Structure", "sweep": "Liquidity Sweep",
+        "zone": "FVG/Order Block", "entry": "5M Confirmation", "vwap": "VWAP Aligned",
+    }
+    tags_txt = ", ".join(tag_map[t] for t in s.get("tags", []) if t in tag_map)
 
     def pct(x):
         return f"{(x - s['entry']) / s['entry'] * 100:+.2f}%"
 
     return (
         f"<b>{icon} {s['side']} SIGNAL — {name}</b>\n"
-        f"⏱ 1H entry (4H trend confirmed)\n\n"
+        f"⏱ Multi-Timeframe (4H→1H→15M→5M) Smart Money setup\n\n"
         f"📍 <b>Entry:</b> {fmt_price(s['entry'])}\n"
         f"🛑 <b>Stop Loss:</b> {fmt_price(s['sl'])} <i>({pct(s['sl'])})</i>\n"
         f"🎯 <b>TP1:</b> {fmt_price(s['tp1'])} <i>({pct(s['tp1'])})</i>\n"
         f"🎯 <b>TP2:</b> {fmt_price(s['tp2'])} <i>({pct(s['tp2'])})</i>\n\n"
         f"⚖️ <b>Risk:Reward:</b> 1:{TP1_RR:g} / 1:{TP2_RR:g}\n"
-        f"💪 <b>Strength:</b> {s['score']}/4\n\n"
+        f"📈 <b>Signal Score:</b> {s['score']}/100\n"
+        f"✅ <b>Confirmed by:</b> {tags_txt}\n\n"
         f"💡 TP1 par half profit lo, phir SL ko entry par le aao.\n"
         f"⚠️ Risk sirf 1-2% per trade, leverage kam rakho.\n\n"
         f"<i>Not financial advice.</i>"
@@ -1056,14 +1208,7 @@ def check_open_signals(data):
 
 def scan_for_signals(data):
     coins = get_top_coins()
-    log(f"Scan shuru: {len(coins)} coins")
-
-    btc_trend = None
-    try:
-        btc_trend = trend_of(get_klines("BTCUSDT", TREND_TF, 300).iloc[:-1])
-    except Exception as e:
-        log(f"BTC trend error: {e}")
-    log(f"BTC 4H trend: {btc_trend}")
+    log(f"Scan shuru: {len(coins)} coins (SMC multi-timeframe engine)")
 
     now = time.time()
     open_syms = {s["symbol"] for s in data["open"]}
@@ -1074,7 +1219,7 @@ def scan_for_signals(data):
         if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
             continue
         try:
-            sig = analyze(sym, btc_trend)
+            sig = analyze(sym)
             if sig:
                 found.append(sig)
         except Exception as e:
