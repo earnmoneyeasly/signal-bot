@@ -84,23 +84,28 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-def send_telegram(text, parse_mode="HTML"):
+def send_telegram(text, parse_mode="HTML", reply_to_message_id=None):
+    """Kamyabi par Telegram message_id return karta hai, warna None."""
     if BOT_TOKEN.startswith("YAHAN"):
         print("\n[DRY RUN - token set nahi hai, sirf screen par dikha raha hun]\n" + text + "\n")
         return True
     try:
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode},
+            data=payload,
             timeout=15,
         )
         if not r.ok:
             log(f"Telegram error: {r.status_code} {r.text}")
-            return False
-        return True
+            return None
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log(f"Telegram error: {e}")
-        return False
+        return None
 
 
 def api_get(path, params=None):
@@ -154,25 +159,30 @@ def fmt_price(p):
     return f"{p:.{decimals}f}"
 
 
-def send_telegram_photo(path, caption, parse_mode="HTML"):
+def send_telegram_photo(path, caption, parse_mode="HTML", reply_to_message_id=None):
+    """Kamyabi par Telegram message_id return karta hai, warna None."""
     if BOT_TOKEN.startswith("YAHAN"):
         print(f"\n[DRY RUN - photo] {caption}\n")
         return True
     try:
+        payload = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": parse_mode}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
         with open(path, "rb") as f:
             r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": parse_mode},
+                data=payload,
                 files={"photo": f},
                 timeout=30,
             )
         if not r.ok:
             log(f"Telegram photo error: {r.status_code} {r.text}")
-            return False
-        return True
+            return None
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log(f"Telegram photo error: {e}")
-        return False
+        return None
 
 
 def make_chart(symbol, title):
@@ -1170,7 +1180,7 @@ def check_open_signals(data):
                     f"Ab SL <b>entry ({fmt_price(s['entry'])})</b> par le aao. Risk-free trade! 🛡️"
                 )
                 img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#15803d", wrap=36, badge="win")
-                send_telegram_photo(img, text)
+                send_telegram_photo(img, text, reply_to_message_id=s.get("message_id"))
             still_open.append(s)
         else:
             if state == "sl":
@@ -1196,7 +1206,7 @@ def check_open_signals(data):
             log_result(s, state)
             full_text = text + "\n\n" + stats_line(data["stats"])
             img = _text_card(header, f"{name} {s['side']}", color, wrap=36, badge=badge)
-            send_telegram_photo(img, full_text)
+            send_telegram_photo(img, full_text, reply_to_message_id=s.get("message_id"))
         time.sleep(0.2)
     data["open"] = still_open
 
@@ -1231,11 +1241,12 @@ def scan_for_signals(data):
     for sig in found[:MAX_SIGNALS_PER_SCAN]:
         try:
             path = make_chart(sig["symbol"], f"{sig['symbol'][:-4]}/USDT - Entry Signal")
-            ok = send_telegram_photo(path, signal_message(sig))
+            msg_id = send_telegram_photo(path, signal_message(sig))
         except Exception as e:
             log(f"Chart error {sig['symbol']}: {e}")
-            ok = send_telegram(signal_message(sig))
-        if ok:
+            msg_id = send_telegram(signal_message(sig))
+        if msg_id:
+            sig["message_id"] = msg_id if isinstance(msg_id, int) else None
             data["open"].append(sig)
             data["last_sent"][sig["symbol"]] = now
             sent += 1
