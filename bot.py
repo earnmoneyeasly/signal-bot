@@ -891,7 +891,7 @@ RISK_TIPS = [
 
 CONTENT_SEQUENCE = [
     "overview", "technical", "education", "coin", "psychology",
-    "news", "risk", "summary",
+    "news", "risk", "gainers", "summary",
 ]
 
 TIP_STYLES = {
@@ -1038,6 +1038,74 @@ def post_daily_summary(data):
         log(f"Summary error: {e}")
 
 
+def post_gainers_losers():
+    try:
+        if datetime.now(timezone.utc).weekday() != 0:  # sirf Monday = weekly
+            log("Gainers/losers: skip, aaj Monday nahi hai")
+            return
+        raw = api_get("/api/v3/ticker/24hr")
+        rows = []
+        for t in raw:
+            sym = t["symbol"]
+            if not sym.endswith("USDT") or sym[:-4] in EXCLUDE:
+                continue
+            try:
+                chg = float(t["priceChangePercent"])
+                vol = float(t["quoteVolume"])
+            except (KeyError, ValueError):
+                continue
+            if vol < 5_000_000:  # bohat illiquid coins hata do (noisy % moves)
+                continue
+            rows.append((sym[:-4], chg))
+        if not rows:
+            return
+        rows.sort(key=lambda x: -x[1])
+        gainers = rows[:5]
+        losers = rows[-5:][::-1]
+        g_txt = "\n".join(f"🟢 {s}: {c:+.2f}%" for s, c in gainers)
+        l_txt = "\n".join(f"🔴 {s}: {c:+.2f}%" for s, c in losers)
+        text = (
+            "<b>🏁 Weekly Top Gainers &amp; Losers</b>\n\n"
+            f"<b>📈 Top Gainers</b>\n{g_txt}\n\n"
+            f"<b>📉 Top Losers</b>\n{l_txt}\n\n"
+            "<i>Based on 24h change (min $5M volume). Not financial advice.</i>"
+        )
+        img = _text_card("Top Gainers & Losers", "Weekly market movers", "#0e7490", wrap=40)
+        send_telegram_photo(img, text)
+    except Exception as e:
+        log(f"Gainers/losers error: {e}")
+
+
+def check_new_listings(data):
+    """Har run mein Binance par nayi USDT listing check karta hai."""
+    try:
+        info = api_get("/api/v3/exchangeInfo")
+        current = set()
+        for s in info.get("symbols", []):
+            if s.get("status") == "TRADING" and s["symbol"].endswith("USDT") and s["symbol"][:-4] not in EXCLUDE:
+                current.add(s["symbol"])
+
+        known = data.get("known_symbols")
+        if known is None:
+            data["known_symbols"] = list(current)  # pehli baar: sirf baseline banao, alert mat karo
+            log(f"New-listing baseline set: {len(current)} symbols")
+            return
+
+        new_syms = current - set(known)
+        for sym in sorted(new_syms):
+            name = sym[:-4] + "/USDT"
+            text = (
+                f"<b>🆕 NEW LISTING — {name}</b>\n\n"
+                f"Just started trading on Binance. Expect high volatility — trade carefully!"
+            )
+            img = _text_card("New Listing", f"{name} is now live on Binance", "#7c3aed", wrap=34)
+            send_telegram_photo(img, text)
+            time.sleep(1)
+        data["known_symbols"] = list(current)
+    except Exception as e:
+        log(f"New listing check error: {e}")
+
+
 def post_content(data):
     idx = data.get("content_idx", 0) % len(CONTENT_SEQUENCE)
     kind = CONTENT_SEQUENCE[idx]
@@ -1054,6 +1122,8 @@ def post_content(data):
             post_news(data)
         elif kind == "summary":
             post_daily_summary(data)
+        elif kind == "gainers":
+            post_gainers_losers()
         elif kind == "education":
             post_tip(data, "education")
         elif kind == "psychology":
@@ -1258,6 +1328,10 @@ def scan_for_signals(data):
 def run_once(force=False):
     data = load_data()
     check_open_signals(data)
+    try:
+        check_new_listings(data)
+    except Exception as e:
+        log(f"New listing outer error: {e}")
     hour_key = int(time.time() // 3600)
     if force or data["last_scan_hour"] != hour_key:
         scan_for_signals(data)
