@@ -24,11 +24,13 @@ import json
 import csv
 import math
 import random
+from collections import Counter
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import requests
 import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -146,8 +148,9 @@ def get_klines(symbol, interval, limit=300, start=None):
         columns=["open_time", "open", "high", "low", "close", "volume",
                  "close_time", "qv", "n", "tb", "tq", "ig"],
     )
-    for c in ["open", "high", "low", "close", "volume"]:
+    for c in ["open", "high", "low", "close", "volume", "tb"]:
         df[c] = df[c].astype(float)
+    df["delta"] = 2 * df["tb"] - df["volume"]   # taker buy - taker sell (CVD/Delta proxy)
     df["open_time"] = df["open_time"].astype("int64")
     return df
 
@@ -338,37 +341,108 @@ def trend_of(df4):
 
 
 # ============================================================
-#  SMART MONEY CONCEPTS (SMC) STRATEGY ENGINE
-#  1) Market Regime   2) Multi-Timeframe (4H/1H/15M/5M)
-#  3) Liquidity (Sweep/BOS/CHOCH)   4) Volume + VWAP
-#  5) Smart Entry (FVG/Order Block/Retest)
-#  6) Quant Filters (ATR, min R:R)   7) Score 0-100
+#  ADVANCED SMC ENGINE
+#  Regime -> Multi-timeframe -> Liquidity -> Smart-money price action
+#  -> Volume/order-flow -> Quant filters -> Context -> Confirmation
+#  -> 0-100 score -> Anti-loss protection -> Adaptive learning
 # ============================================================
 
-MIN_SIGNAL_SCORE = 70   # 100 mein se, sirf isse zyada score wale signals post hote hain
-SWING_L = 2              # swing high/low detect karne ke liye left/right bars
+MIN_SIGNAL_SCORE = 80      # 80 se neeche = NO SIGNAL
+VERY_STRONG_SCORE = 90     # 90+ = Very strong, 80-89 = Strong
+SWING_L = 2
 SWING_R = 2
-VOL_LOOKBACK = 100        # kitni purani candles se "normal" volatility nikalni hai
-VOL_PCTL_MAX = 0.85       # is percentile se upar ATR% ho to "high volatility" mana jata hai
+VOL_LOOKBACK = 100
+VOL_PCTL_MAX = 0.85        # ATR% is percentile se upar = high-volatility (no trade)
+ADX_MIN = 20               # trend strength minimum
+MIN_NET_RR = 1.5           # fees + spread ke baad expected R:R
+MIN_EV = 0.15              # expected value (R units) minimum
+MAX_SPREAD_PCT = 0.10
+FEE_PCT = 0.05             # per side (round trip = 2x)
+FUNDING_EXTREME = 0.0005   # 0.05% per 8h
+DOM_HARD = 0.8             # BTC dominance 24h change (pp) jis se upar/neeche alt trade block
+MAX_SAME_DIR_OPEN = 3      # ek direction mein max open signals (correlation protection)
+MAX_SIGNALS_PER_DAY = 5
+DAILY_MAX_LOSSES = 3
+LOSS_STREAK_COOLDOWN = 3   # itne consecutive losses ke baad cooldown
+LOSS_STREAK_COOLDOWN_H = 6
+RAISE_AFTER_LOSSES = 2     # itne consecutive losses ke baad sirf 90+ score
+MIN_TRADES_FOR_ADAPT = 12
+# High-impact news (FOMC/CPI) ke waqt manually yahan add karo, UTC mein:
+# NEWS_BLACKOUT_UTC = [("2026-10-28 17:30", "2026-10-28 20:30")]
+NEWS_BLACKOUT_UTC = []
+WIN_RESULTS = {"tp2", "tp1_close", "be"}
+FUT_BASE = "https://fapi.binance.com"
+
+WEIGHTS = {
+    "htf_trend": 8, "btc_context": 5, "market_context": 5, "structure_1h": 4,
+    "sweep": 8, "failed_breakout": 2, "displacement": 6, "break": 6,
+    "zone": 8, "retest": 7, "pd_ote": 5, "volume_confirm": 8,
+    "vwap": 3, "cvd_delta": 4, "derivatives": 6, "momentum": 3,
+    "rr_quality": 4, "liquidity_target": 4, "spread_quality": 2, "ev_quality": 2,
+}
+TAG_LABELS = {
+    "htf_trend": "1D+4H Trend", "btc_context": "BTC Aligned", "market_context": "Market Context",
+    "structure_1h": "1H Structure", "sweep": "Liquidity Sweep", "failed_breakout": "Failed Breakout",
+    "displacement": "Displacement", "break": "BOS/CHOCH", "zone": "FVG/OB Zone",
+    "retest": "Retest", "pd_ote": "Discount/OTE", "volume_confirm": "Volume Confirm",
+    "vwap": "VWAP", "cvd_delta": "CVD/Delta", "derivatives": "OI/Funding/LS",
+    "momentum": "Momentum", "rr_quality": "Good R:R", "liquidity_target": "Liquidity Target",
+    "spread_quality": "Tight Spread", "ev_quality": "Positive EV",
+}
+LEVEL_Q = {"PWL": 1.0, "PWH": 1.0, "PDL": 1.0, "PDH": 1.0, "EQL": 0.9, "EQH": 0.9,
+           "1H swing": 0.7, "15m swing": 0.6}
+
+REJECTS = Counter()
+_FUT = {"ok": True}
+
+
+def _rej(reason):
+    REJECTS[reason] += 1
+    return None
+
+
+def today_key():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def adx(df, n=14):
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plus = ((up > dn) & (up > 0)) * up
+    minus = ((dn > up) & (dn > 0)) * dn
+    a = atr(df, n)
+    pdi = 100 * plus.ewm(alpha=1 / n, adjust=False).mean() / a
+    mdi = 100 * minus.ewm(alpha=1 / n, adjust=False).mean() / a
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan"))
+    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(0), pdi.fillna(0), mdi.fillna(0)
+
+
+def mirror_df(df):
+    """SHORT setups ko LONG logic se check karne ke liye price ko ulta (negative) kar deta hai."""
+    m = df.copy()
+    m["open"] = -df["open"]
+    m["close"] = -df["close"]
+    m["high"] = -df["low"]
+    m["low"] = -df["high"]
+    if "delta" in m:
+        m["delta"] = -df["delta"]
+    return m
 
 
 def find_swings(df, left=SWING_L, right=SWING_R):
-    """Fractal swing highs/lows dhundta hai. Return: list of (index, price)."""
     highs, lows = df["high"].values, df["low"].values
     n = len(df)
     sh, sl = [], []
     for i in range(left, n - right):
-        window_h = highs[i - left:i + right + 1]
-        window_l = lows[i - left:i + right + 1]
-        if highs[i] == window_h.max():
-            sh.append((i, highs[i]))
-        if lows[i] == window_l.min():
-            sl.append((i, lows[i]))
+        if highs[i] == highs[i - left:i + right + 1].max():
+            sh.append((i, float(highs[i])))
+        if lows[i] == lows[i - left:i + right + 1].min():
+            sl.append((i, float(lows[i])))
     return sh, sl
 
 
 def market_regime(df4):
-    """1) Market Regime: Bull/Bear/Sideways + high-volatility restriction."""
+    """Regime: bias (LONG/SHORT/None=sideways) + volatility state."""
     if len(df4) < 210:
         return None, "unknown"
     bias = trend_of(df4)
@@ -377,175 +451,587 @@ def market_regime(df4):
     recent = atr_pct.tail(VOL_LOOKBACK)
     if len(recent) < 20:
         return bias, "normal"
-    rank = (recent < recent.iloc[-1]).mean()  # current ATR% ka percentile
-    vol_state = "high" if rank >= VOL_PCTL_MAX else "normal"
-    return bias, vol_state
+    rank = (recent < recent.iloc[-1]).mean()
+    return bias, ("high" if rank >= VOL_PCTL_MAX else "normal")
+
+
+def day_bias(d):
+    if len(d) < 60:
+        return None
+    c = d["close"]
+    e20, e50, p = ema(c, 20).iloc[-1], ema(c, 50).iloc[-1], c.iloc[-1]
+    if p > e50 and e20 > e50:
+        return "LONG"
+    if p < e50 and e20 < e50:
+        return "SHORT"
+    return None
 
 
 def structure_check(df1h, bias):
-    """2)+3) 1H market structure: BOS (continuation) vs CHOCH (reversal warning)."""
+    """1H: BOS/higher-structure (continuation) aur CHOCH (trend ulatne ka warning)."""
     sh, sl = find_swings(df1h)
     if len(sh) < 2 or len(sl) < 2:
         return False, False
     price = df1h["close"].iloc[-1]
-    last_sh = sh[-1][1]
-    last_sl = sl[-1][1]
-    prev_sh = sh[-2][1]
-    prev_sl = sl[-2][1]
-
+    last_sh, last_sl = sh[-1][1], sl[-1][1]
+    prev_sh, prev_sl = sh[-2][1], sl[-2][1]
     if bias == "LONG":
-        bos = price > last_sh                          # naya high break -> uptrend continuation
-        higher_structure = last_sh > prev_sh and last_sl > prev_sl   # HH + HL
-        choch = price < last_sl                         # trend ke khilaf swing low toot gaya
-        return (bos or higher_structure), choch
-    else:
-        bos = price < last_sl
-        lower_structure = last_sh < prev_sh and last_sl < prev_sl    # LH + LL
-        choch = price > last_sh
-        return (bos or lower_structure), choch
+        return (price > last_sh or (last_sh > prev_sh and last_sl > prev_sl)), price < last_sl
+    return (price < last_sl or (last_sh < prev_sh and last_sl < prev_sl)), price > last_sh
 
 
-def liquidity_sweep(df15, bias):
-    """3) Liquidity sweep: wick stop-hunt ke baad price wapas andar close ho."""
-    sh, sl = find_swings(df15)
-    if not sh or not sl:
-        return False
-    recent = df15.tail(6)
-    if bias == "LONG":
-        level = sl[-1][1]
-        return bool(((recent["low"] < level) & (recent["close"] > level)).any())
-    else:
-        level = sh[-1][1]
-        return bool(((recent["high"] > level) & (recent["close"] < level)).any())
+def htf_levels(d1):
+    """Previous Day / Previous Week high-low."""
+    lv = {}
+    if len(d1) >= 2:
+        lv["PDH"] = float(d1["high"].iloc[-1])
+        lv["PDL"] = float(d1["low"].iloc[-1])
+    try:
+        dt = pd.to_datetime(d1["open_time"], unit="ms")
+        wk = dt.dt.to_period("W")
+        weeks = list(dict.fromkeys(wk.tolist()))
+        if len(weeks) >= 2:
+            last_is_sunday = dt.iloc[-1].weekday() == 6
+            target = weeks[-1] if last_is_sunday else weeks[-2]
+            prev = d1[wk == target]
+            if len(prev):
+                lv["PWH"] = float(prev["high"].max())
+                lv["PWL"] = float(prev["low"].min())
+    except Exception:
+        pass
+    return lv
 
 
-def find_zone(df15, bias):
-    """5) FVG (Fair Value Gap) ya Order Block zone dhundta hai, aur check karta hai
-    price abhi us zone ke andar/qareeb hai ya nahi (retest)."""
-    highs, lows, opens, closes = df15["high"].values, df15["low"].values, df15["open"].values, df15["close"].values
-    n = len(df15)
-    price = closes[-1]
-    zone = None
-    # FVG: 3-candle imbalance, last 25 candles mein dhundo (sab se recent zone use karo)
-    for i in range(n - 3, max(n - 26, 2), -1):
-        if bias == "LONG" and lows[i + 1] > highs[i - 1]:
-            zone = (highs[i - 1], lows[i + 1])
+def equal_levels(df1h, a1h):
+    """Equal highs / equal lows (liquidity pools)."""
+    sh, sl = find_swings(df1h.tail(200).reset_index(drop=True))
+    tol = max(a1h * 0.25, float(df1h["close"].iloc[-1]) * 0.001)
+
+    def cluster(pts):
+        vals = [p for _, p in pts]
+        out = set()
+        for x in range(len(vals)):
+            for y in range(x + 1, len(vals)):
+                if abs(vals[x] - vals[y]) <= tol:
+                    out.add(round((vals[x] + vals[y]) / 2, 8))
+        return sorted(out)[-6:]
+
+    return cluster(sh), cluster(sl)
+
+
+def corr_with_btc(df1h, ctx):
+    br = ctx.get("btc_ret")
+    if br is None:
+        return None
+    r = df1h["close"].pct_change().tail(len(br)).values
+    m = min(len(r), len(br))
+    r, b = r[-m:], br[-m:]
+    if m < 30 or np.nanstd(r) == 0 or np.nanstd(b) == 0:
+        return None
+    r = np.nan_to_num(r)
+    b = np.nan_to_num(b)
+    return float(np.corrcoef(r, b)[0, 1])
+
+
+# ---------------- external data (futures / spread) ----------------
+
+def fut_get(path, params):
+    if not _FUT["ok"]:
+        return None
+    try:
+        r = requests.get(FUT_BASE + path, params=params, timeout=8)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (403, 418, 429, 451):
+            _FUT["ok"] = False   # region-blocked / rate-limited: is scan mein futures data band
+        return None
+    except Exception:
+        _FUT["ok"] = False
+        return None
+
+
+def futures_metrics(symbol):
+    out = {"funding": None, "oi_chg": None, "ls": None}
+    fr = fut_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    if isinstance(fr, dict) and "lastFundingRate" in fr:
+        out["funding"] = float(fr["lastFundingRate"])
+    oi = fut_get("/futures/data/openInterestHist", {"symbol": symbol, "period": "15m", "limit": 12})
+    if isinstance(oi, list) and len(oi) >= 2:
+        first, last = float(oi[0]["sumOpenInterest"]), float(oi[-1]["sumOpenInterest"])
+        if first > 0:
+            out["oi_chg"] = (last / first - 1) * 100
+    ls = fut_get("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "1h", "limit": 1})
+    if isinstance(ls, list) and ls:
+        out["ls"] = float(ls[-1]["longShortRatio"])
+    return out
+
+
+def deriv_frac(side, fm):
+    parts = []
+    if fm["funding"] is not None:
+        f = fm["funding"] if side == "LONG" else -fm["funding"]
+        parts.append(1.0 if f < 0.0002 else 0.6)
+    if fm["oi_chg"] is not None:
+        parts.append(1.0 if fm["oi_chg"] > 0.5 else 0.5)   # OI barh raha = naye positions trend ke sath
+    if fm["ls"] is not None:
+        ratio = fm["ls"] if side == "LONG" else (1 / fm["ls"] if fm["ls"] > 0 else 1)
+        parts.append(1.0 if ratio < 1.5 else 0.6 if ratio < 2.5 else 0.2)   # crowded trade = risky
+    return sum(parts) / len(parts) if parts else None
+
+
+def spread_pct(symbol):
+    try:
+        t = api_get("/api/v3/ticker/bookTicker", {"symbol": symbol})
+        bid, ask = float(t["bidPrice"]), float(t["askPrice"])
+        mid = (bid + ask) / 2
+        return (ask - bid) / mid * 100 if mid > 0 else None
+    except Exception:
+        return None
+
+
+# ---------------- market context (ek baar per scan) ----------------
+
+def build_context(data):
+    ctx = {"ok": True, "reasons": [], "btc_bias": None, "btc_1d": None, "eth_btc": None,
+           "dominance": None, "dom_change": None, "mkt_change": None, "btc_ret": None}
+    now_utc = datetime.now(timezone.utc)
+    for a, b in NEWS_BLACKOUT_UTC:
+        try:
+            s = datetime.strptime(a, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            e = datetime.strptime(b, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            if s <= now_utc <= e:
+                ctx["ok"] = False
+                ctx["reasons"].append("high-impact news window")
+        except Exception:
+            pass
+    try:
+        b4 = get_klines("BTCUSDT", "4h", 300).iloc[:-1]
+        b1d = get_klines("BTCUSDT", "1d", 120).iloc[:-1]
+        b1h = get_klines("BTCUSDT", "1h", 300).iloc[:-1]
+        b15 = get_klines("BTCUSDT", "15m", 200).iloc[:-1]
+        ctx["btc_bias"] = trend_of(b4)
+        ctx["btc_1d"] = day_bias(b1d)
+        ctx["btc_ret"] = b1h["close"].pct_change().tail(100).values
+        rng = (b15["high"] - b15["low"]).tail(3)
+        prev_atr = atr(b15).shift(1).tail(3)
+        if bool((rng > 3.5 * prev_atr).any()):   # news/shock proxy
+            ctx["ok"] = False
+            ctx["reasons"].append("BTC volatility shock")
+    except Exception as e:
+        log(f"BTC context error: {e}")
+    try:
+        eb = get_klines("ETHBTC", "4h", 200).iloc[:-1]
+        c = eb["close"]
+        e50 = ema(c, 50)
+        if c.iloc[-1] > e50.iloc[-1] and e50.iloc[-1] > e50.iloc[-6]:
+            ctx["eth_btc"] = "LONG"
+        elif c.iloc[-1] < e50.iloc[-1] and e50.iloc[-1] < e50.iloc[-6]:
+            ctx["eth_btc"] = "SHORT"
+    except Exception as e:
+        log(f"ETHBTC error: {e}")
+    try:
+        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=15).json()["data"]
+        ctx["mkt_change"] = g.get("market_cap_change_percentage_24h_usd")
+        ctx["dominance"] = g["market_cap_percentage"]["btc"]
+        hist = data.setdefault("dom_hist", [])
+        hist.append([int(time.time()), ctx["dominance"]])
+        data["dom_hist"] = hist[-150:]
+        old = [v for t, v in data["dom_hist"] if time.time() - t >= 20 * 3600]
+        if old:
+            ctx["dom_change"] = ctx["dominance"] - old[-1]
+    except Exception as e:
+        log(f"Global market data error: {e}")
+    if ctx["mkt_change"] is not None and ctx["mkt_change"] < -8:
+        ctx["ok"] = False
+        ctx["reasons"].append("market crash (-8% 24h)")
+    return ctx
+
+
+# ---------------- anti-loss protection + adaptive learning ----------------
+
+def protection_state(data):
+    """(allowed, reason, min_score)"""
+    hist = data.get("history", [])
+    day = today_key()
+    if data.get("sent_today", {}).get(day, 0) >= MAX_SIGNALS_PER_DAY:
+        return False, "daily signal limit reached", MIN_SIGNAL_SCORE
+    if sum(1 for h in hist if h.get("day") == day and h.get("result") == "sl") >= DAILY_MAX_LOSSES:
+        return False, "daily loss limit reached", MIN_SIGNAL_SCORE
+    streak, last_loss_t = 0, 0
+    for h in reversed(hist):
+        if h.get("result") == "sl":
+            streak += 1
+            last_loss_t = max(last_loss_t, h.get("closed", 0))
+        elif h.get("result") in WIN_RESULTS:
             break
-        if bias == "SHORT" and highs[i + 1] < lows[i - 1]:
-            zone = (highs[i + 1], lows[i - 1])
+    if streak >= LOSS_STREAK_COOLDOWN and time.time() - last_loss_t < LOSS_STREAK_COOLDOWN_H * 3600:
+        return False, f"cooldown after {streak} consecutive losses", MIN_SIGNAL_SCORE
+    return True, "", (VERY_STRONG_SCORE if streak >= RAISE_AFTER_LOSSES else MIN_SIGNAL_SCORE)
+
+
+def adaptive_stats(data):
+    """History se: har condition (tag) aur har regime ka (trades, wins)."""
+    tag, reg = {}, {}
+    for h in data.get("history", []):
+        res = h.get("result")
+        if res != "sl" and res not in WIN_RESULTS:
+            continue
+        win = 1 if res in WIN_RESULTS else 0
+        for t in h.get("tags", []):
+            n, w = tag.get(t, (0, 0))
+            tag[t] = (n + 1, w + win)
+        r = h.get("regime")
+        if r:
+            n, w = reg.get(r, (0, 0))
+            reg[r] = (n + 1, w + win)
+    return tag, reg
+
+
+def tag_factor(tag_stats, name):
+    n, w = tag_stats.get(name, (0, 0))
+    if n < MIN_TRADES_FOR_ADAPT:
+        return 1.0
+    return max(0.6, min(1.3, 0.5 + w / n))   # win-rate 50% -> 1.0
+
+
+def est_win_prob(data, score):
+    band = [h for h in data.get("history", [])
+            if h.get("score") is not None and h["score"] >= score - 5
+            and (h.get("result") == "sl" or h.get("result") in WIN_RESULTS)]
+    if len(band) >= 20:
+        return sum(1 for h in band if h["result"] in WIN_RESULTS) / len(band)
+    return max(0.35, min(0.65, 0.45 + (score - 80) * 0.01))
+
+
+# ---------------- core sequence: Sweep -> Displacement -> BOS/CHOCH -> FVG/OB -> Retest ----------------
+
+def seq_long(m, sell_levels, a):
+    """LONG-space par kaam karta hai (SHORT ke liye mirrored df aata hai)."""
+    n = len(m)
+    H, L, O, C = m["high"].values, m["low"].values, m["open"].values, m["close"].values
+    V, A = m["volume"].values, a.values
+    sh, sl = find_swings(m)
+
+    # 1) Liquidity sweep
+    best = None
+    for i in range(n - 3, max(n - 41, 10), -1):
+        cands = list(sell_levels) + [("15m swing", p) for idx, p in sl if idx < i - 2][-3:]
+        hit = None
+        for name, lv in cands:
+            if L[i] < lv and C[i] > lv:
+                q = LEVEL_Q.get(name, 0.6)
+                if hit is None or q > hit[2]:
+                    hit = (name, lv, q)
+        if hit:
+            best = (i, hit)
             break
-    if zone is None:
-        # Order Block fallback: BOS candle se pehle wali ulti-rang candle
-        for i in range(n - 2, max(n - 26, 1), -1):
-            if bias == "LONG" and closes[i] < opens[i] and closes[i + 1] > opens[i + 1]:
-                zone = (lows[i], highs[i])
-                break
-            if bias == "SHORT" and closes[i] > opens[i] and closes[i + 1] < opens[i + 1]:
-                zone = (lows[i], highs[i])
-                break
-    if zone is None:
-        return False
-    lo, hi = min(zone), max(zone)
-    pad = (hi - lo) * 0.5
-    return (lo - pad) <= price <= (hi + pad)
+    if best is None:
+        return _rej("no liquidity sweep")
+    i, (lname, lvl, lq) = best
+    extreme = float(L[max(i - 2, 0):min(i + 3, n)].min())
+    if (C[i + 1:] < extreme).any():
+        return _rej("sweep low violated (setup invalid)")
+
+    # 2) Displacement
+    d = None
+    for j in range(i, min(i + 8, n - 1)):
+        rng, body = H[j] - L[j], C[j] - O[j]
+        if rng > 0 and body > 0 and rng >= 1.3 * A[max(j - 1, 0)] and body / rng >= 0.55:
+            d = j
+            break
+    if d is None:
+        return _rej("no displacement after sweep")
+
+    # 3) BOS / CHOCH / MSS
+    pre_sh = [p for idx, p in sh if idx < i]
+    pre_sl = [p for idx, p in sl if idx < i]
+    if not pre_sh:
+        return _rej("no swing high to break")
+    H0 = pre_sh[-1]
+    if not (C[d:] > H0).any():
+        return _rej("no BOS/CHOCH after displacement")
+    bearish_prior = (len(pre_sl) >= 2 and len(pre_sh) >= 2
+                     and pre_sl[-1] < pre_sl[-2] and pre_sh[-1] < pre_sh[-2])
+    kind = "CHOCH" if bearish_prior else "BOS"
+
+    # 4) Zones: FVG / Order Block / Breaker / IFVG
+    zones = []
+    for k in range(max(d - 1, 1), min(d + 2, n - 1)):
+        if L[k + 1] > H[k - 1]:
+            zones.append(("FVG", float(H[k - 1]), float(L[k + 1])))
+    for k in range(d - 1, max(i - 6, 0), -1):
+        if C[k] < O[k]:
+            zones.append(("OB", float(L[k]), float(H[k])))
+            break
+    for k in range(i - 1, max(i - 16, 0), -1):
+        if C[k] > O[k]:
+            if C[d:].max() > H[k]:
+                zones.append(("BREAKER", float(L[k]), float(H[k])))
+            break
+    for k in range(i, max(i - 21, 1), -1):
+        if k + 1 < n and H[k + 1] < L[k - 1] and C[d:].max() > L[k - 1]:
+            zones.append(("IFVG", float(H[k + 1]), float(L[k - 1])))
+            break
+    if not zones:
+        return _rej("no FVG/OB zone")
+
+    # 5) Retest confirmation
+    chosen = None
+    last_close = C[n - 1]
+    for typ, lo, hi in zones:
+        touched = any(L[k] <= hi and H[k] >= lo for k in range(max(d + 1, n - 10), n))
+        if touched and lo <= last_close <= hi + 1.2 * A[-1]:
+            chosen = (typ, lo, hi)
+            break
+    if chosen is None:
+        return _rej("no retest of entry zone")
+
+    # 6) Premium / Discount / OTE
+    leg_high = float(H[d:n].max())
+    rngl = leg_high - extreme
+    retr = (leg_high - last_close) / rngl if rngl > 0 else 0.0
+
+    # 7) Failed breakout
+    failed = False
+    for k in range(max(i - 3, 0), min(i + 3, n - 3)):
+        if C[k] < lvl and (C[k + 1:k + 4] > lvl).any():
+            failed = True
+            break
+
+    vol_base = V[max(d - 20, 0):d].mean() if d > 0 else 0
+    return {
+        "level_name": lname, "level_q": float(lq), "extreme": extreme, "d": int(d),
+        "kind": kind, "zones": sorted(set(z[0] for z in zones)), "zone": chosen,
+        "discount": bool(retr >= 0.5), "ote": bool(0.62 <= retr <= 0.79),
+        "failed_breakout": bool(failed),
+        "disp_ratio": float((H[d] - L[d]) / A[max(d - 1, 0)]) if A[max(d - 1, 0)] > 0 else 1.0,
+        "disp_rv": float(V[d] / vol_base) if vol_base > 0 else 1.0,
+        "bull_close": bool(C[n - 1] > O[n - 1]),
+    }
 
 
-def entry_confirmation(df5, bias):
-    """4) 5M entry confirmation: strong-body candle + volume anomaly (order-flow proxy)."""
-    if len(df5) < 25:
-        return False
+def five_min_confirm(df5, side):
+    """5M execution: strong candle + relative volume + delta/CVD."""
+    if len(df5) < 30:
+        return False, {}
     last = df5.iloc[-1]
     rng = last["high"] - last["low"]
     if rng <= 0:
-        return False
-    body = abs(last["close"] - last["open"])
-    body_ratio = body / rng
-    vol_ratio = last["volume"] / df5["volume"].rolling(20).mean().iloc[-1]
-    if bias == "LONG":
-        direction_ok = last["close"] > last["open"]
-    else:
-        direction_ok = last["close"] < last["open"]
-    return bool(direction_ok and body_ratio >= 0.45 and vol_ratio >= VOL_MULT)
+        return False, {}
+    body = (last["close"] - last["open"]) if side == "LONG" else (last["open"] - last["close"])
+    avg_v = df5["volume"].rolling(20).mean().iloc[-1]
+    rv = last["volume"] / avg_v if avg_v and avg_v > 0 else 0
+    has_delta = bool(df5["delta"].abs().sum() > 0)
+    d_last = last["delta"] if side == "LONG" else -last["delta"]
+    cvd = df5["delta"].tail(12).sum()
+    cvd_ok = (cvd > 0) if side == "LONG" else (cvd < 0)
+    ok = body > 0 and body / rng >= 0.5 and rv >= VOL_MULT and (not has_delta or d_last > 0)
+    return bool(ok), {"rv": float(rv), "has_delta": has_delta, "cvd_ok": bool(cvd_ok)}
 
 
-def vwap_check(df, bias):
-    """4) VWAP ke sahi side par price honi chahiye (order-flow proxy, CVD data free mein nahi milta)."""
-    v = vwap(df)
-    price = df["close"].iloc[-1]
-    return bool(price > v.iloc[-1]) if bias == "LONG" else bool(price < v.iloc[-1])
+def market_context_frac(side, symbol, ctx):
+    votes = []
+    if symbol != "BTCUSDT":
+        dc = ctx.get("dom_change")
+        if dc is not None:
+            votes.append(1.0 if (side == "LONG" and dc < 0) or (side == "SHORT" and dc > 0) else 0.3)
+        eb = ctx.get("eth_btc")
+        if eb is not None:
+            votes.append(1.0 if eb == side else 0.4)
+    mc = ctx.get("mkt_change")
+    if mc is not None:
+        votes.append(1.0 if (side == "LONG" and mc > 0) or (side == "SHORT" and mc < 0) else 0.3)
+    return sum(votes) / len(votes) if votes else None
 
 
-def analyze(symbol):
-    # ---- 1) Market Regime (4H) ----
+def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
+    # ---- 1) Market regime (4H): bull/bear/sideways, trend strength, volatility ----
     df4 = get_klines(symbol, "4h", 300).iloc[:-1]
-    bias, vol_state = market_regime(df4)
-    if bias is None:
-        return None
+    side, vol_state = market_regime(df4)
+    if side is None:
+        return _rej("sideways / no clear 4H trend")
     if vol_state == "high":
-        return None  # high-volatility market mein signals restrict
+        return _rej("high-volatility regime")
+    adx4 = float(adx(df4)[0].iloc[-1])
+    if adx4 < ADX_MIN:
+        return _rej("weak trend strength (ADX)")
+    regime = "bull" if side == "LONG" else "bear"
+    n_r, w_r = reg_stats.get(regime, (0, 0))
+    if n_r >= MIN_TRADES_FOR_ADAPT and w_r / n_r < 0.30:
+        return _rej("regime underperforming (adaptive block)")
+    if symbol != "BTCUSDT":
+        dc = ctx.get("dom_change")
+        if dc is not None and ((side == "LONG" and dc > DOM_HARD) or (side == "SHORT" and dc < -DOM_HARD)):
+            return _rej("BTC dominance against trade")
 
-    # ---- 2) Multi-timeframe data ----
+    # ---- 2) Multi-timeframe: 1D bias, 1H structure ----
+    df1d = get_klines(symbol, "1d", 120).iloc[:-1]
+    b1d = day_bias(df1d)
+    if b1d is not None and b1d != side:
+        return _rej("1D bias opposes 4H")
     df1h = get_klines(symbol, "1h", 300).iloc[:-1]
-    df15 = get_klines(symbol, "15m", 300).iloc[:-1]
-    df5 = get_klines(symbol, "5m", 200).iloc[:-1]
-    if len(df1h) < 60 or len(df15) < 60 or len(df5) < 30:
-        return None
-
-    price = float(df15["close"].iloc[-1])
-    a15 = atr(df15)
-    a_now = float(a15.iloc[-1])
-    if a_now / price * 100 < MIN_ATR_PCT:
-        return None  # market bohat flat/dead hai
-
-    # ---- score components ----
-    bos_ok, choch = structure_check(df1h, bias)
-    sweep_ok = liquidity_sweep(df15, bias)
-    zone_ok = find_zone(df15, bias)
-    entry_ok = entry_confirmation(df5, bias)
-    vwap_ok = vwap_check(df15, bias)
-
+    if len(df1h) < 100:
+        return _rej("not enough 1H data")
+    structure_ok, choch = structure_check(df1h, side)
     if choch:
-        return None  # CHOCH = trend ulat raha hai, is coin ko skip karo
+        return _rej("1H CHOCH against trend")
+    btc4 = ctx.get("btc_bias")
+    corr = corr_with_btc(df1h, ctx)
+    if symbol != "BTCUSDT" and btc4 and btc4 != side and corr is not None and corr >= 0.6:
+        return _rej("BTC direction opposes (correlated)")
 
-    weights = {
-        "trend": 20,       # 4H regime clear hai
-        "structure": 20,   # 1H BOS / higher structure
-        "sweep": 15,       # liquidity sweep mila
-        "zone": 15,        # FVG/Order Block retest zone ke andar
-        "entry": 20,       # 5M entry confirmation candle + volume
-        "vwap": 10,        # VWAP ke sahi side
-    }
-    hits = {
-        "trend": True,
-        "structure": bos_ok,
-        "sweep": sweep_ok,
-        "zone": zone_ok,
-        "entry": entry_ok,
-        "vwap": vwap_ok,
-    }
-    score = sum(weights[k] for k, ok in hits.items() if ok)
-    if score < MIN_SIGNAL_SCORE:
-        return None
-    if not entry_ok:
-        return None  # entry confirmation ke bagair kabhi bhi post na karo
+    df15 = get_klines(symbol, "15m", 300).iloc[:-1]
+    if len(df15) < 100:
+        return _rej("not enough 15M data")
+    a15 = atr(df15)
+    a15v = float(a15.iloc[-1])
+    if a15v / float(df15["close"].iloc[-1]) * 100 < MIN_ATR_PCT:
+        return _rej("market too flat")
+    a1h = float(atr(df1h).iloc[-1])
 
-    # ---- Quant filter: SL/TP via ATR, min Risk:Reward already TP1_RR/TP2_RR ----
-    risk = SL_ATR_MULT * a_now
-    if bias == "LONG":
-        sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+    # ---- 3) Liquidity map ----
+    htf = htf_levels(df1d)
+    eq_h, eq_l = equal_levels(df1h, a1h)
+    sh1, sl1 = find_swings(df1h)
+    sw_hi = [p for _, p in sh1[-5:]]
+    sw_lo = [p for _, p in sl1[-5:]]
+    if side == "LONG":
+        sell = [(k, htf[k]) for k in ("PWL", "PDL") if k in htf]
+        sell += [("EQL", p) for p in eq_l] + [("1H swing", p) for p in sw_lo]
+        blockers = [htf[k] for k in ("PDH", "PWH") if k in htf] + eq_h
+        targets = blockers + sw_hi
+        m15 = df15
     else:
-        sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+        sell = [(k, -htf[k]) for k in ("PWH", "PDH") if k in htf]
+        sell += [("EQH", -p) for p in eq_h] + [("1H swing", -p) for p in sw_hi]
+        blockers = [-htf[k] for k in ("PDL", "PWL") if k in htf] + [-p for p in eq_l]
+        targets = blockers + [-p for p in sw_lo]
+        m15 = mirror_df(df15)
 
+    # ---- 4) Sweep -> Displacement -> BOS/CHOCH -> FVG/OB -> Retest ----
+    seq = seq_long(m15, sell, a15)
+    if seq is None:
+        return None
+
+    # ---- 5) 5M execution + volume/order flow ----
+    df5 = get_klines(symbol, "5m", 200).iloc[:-1]
+    ok5, x5 = five_min_confirm(df5, side)
+    if not ok5:
+        return _rej("no 5M volume/entry confirmation")
+    price = float(df5["close"].iloc[-1])
+    conv = 1 if side == "LONG" else -1
+    price_m = conv * price
+
+    # ---- 6) Quant filters: spread, SL/TP, net R:R ----
+    sp = spread_pct(symbol)
+    if sp is not None and sp > MAX_SPREAD_PCT:
+        return _rej("spread too wide")
+    cost_pct = FEE_PCT * 2 + (sp if sp is not None else 0.05)
+
+    sl_m = seq["extreme"] - 0.25 * a15v
+    risk = price_m - sl_m
+    if risk < 1.0 * a15v:
+        sl_m = price_m - 1.0 * a15v
+        risk = 1.0 * a15v
+    risk_pct = risk / abs(price_m) * 100
+    if risk > 6.0 * a15v or risk_pct > 6.0:
+        return _rej("structural stop too far")
+    if any(price_m < p < price_m + 1.0 * risk for p in blockers):
+        return _rej("major level blocks path to TP1")
+    tp1_m = price_m + TP1_RR * risk
+    lt = sorted(p for p in targets if price_m + 2.5 * risk <= p <= price_m + 6 * risk)
+    tp2_m = lt[0] if lt else price_m + TP2_RR * risk
+    entry, sl, tp1, tp2 = price, conv * sl_m, conv * tp1_m, conv * tp2_m
+
+    r1 = abs(tp1 - entry) / entry * 100
+    r2 = abs(tp2 - entry) / entry * 100
+    rr1n = (r1 - cost_pct) / (risk_pct + cost_pct)
+    rr2n = (r2 - cost_pct) / (risk_pct + cost_pct)
+    rr_eff = 0.5 * rr1n + 0.5 * rr2n
+    if rr_eff < MIN_NET_RR:
+        return _rej("net R:R too low after costs")
+
+    # momentum + VWAP
+    c15 = df15["close"]
+    e20 = ema(c15, 20).iloc[-1]
+    mom = (c15.iloc[-1] > e20 and c15.iloc[-1] > c15.iloc[-6]) if side == "LONG" \
+        else (c15.iloc[-1] < e20 and c15.iloc[-1] < c15.iloc[-6])
+    w = df15.tail(96)
+    tp_ = (w["high"] + w["low"] + w["close"]) / 3
+    vw = float((tp_ * w["volume"]).sum() / w["volume"].sum()) if w["volume"].sum() > 0 else price
+    vwap_ok = price > vw if side == "LONG" else price < vw
+
+    # ---- 7) Derivatives: funding / OI / long-short ----
+    fm = futures_metrics(symbol)
+    fnd = fm["funding"]
+    if fnd is not None and ((side == "LONG" and fnd > FUNDING_EXTREME) or (side == "SHORT" and fnd < -FUNDING_EXTREME)):
+        return _rej("extreme funding against trade")
+
+    # ---- 8) Scoring (0-100) ----
+    comp = {}
+    if b1d == side:
+        comp["htf_trend"] = 1.0 if adx4 >= 25 else 0.75
+    else:
+        comp["htf_trend"] = 0.5
+    if symbol == "BTCUSDT":
+        comp["btc_context"] = 1.0
+    elif btc4 is None:
+        comp["btc_context"] = 0.5
+    elif btc4 == side:
+        comp["btc_context"] = 1.0 if ctx.get("btc_1d") in (None, side) else 0.8
+    else:
+        comp["btc_context"] = 0.3
+    comp["market_context"] = market_context_frac(side, symbol, ctx)
+    comp["structure_1h"] = 1.0 if structure_ok else 0.3
+    comp["sweep"] = seq["level_q"]
+    comp["failed_breakout"] = 1.0 if seq["failed_breakout"] else 0.0
+    comp["displacement"] = 1.0 if seq["disp_ratio"] >= 2.0 else 0.75 if seq["disp_ratio"] >= 1.6 else 0.55
+    comp["break"] = 1.0 if seq["kind"] == "CHOCH" else 0.85
+    nz = len(seq["zones"])
+    comp["zone"] = 1.0 if nz >= 3 else 0.85 if nz == 2 else 0.65
+    comp["retest"] = 1.0 if seq["bull_close"] else 0.7
+    comp["pd_ote"] = 1.0 if seq["ote"] else 0.7 if seq["discount"] else 0.3
+    comp["volume_confirm"] = min(1.0, 0.5 + 0.25 * (x5["rv"] >= 1.5) + 0.25 * (seq["disp_rv"] >= 1.5))
+    comp["vwap"] = 1.0 if vwap_ok else 0.2
+    comp["cvd_delta"] = (1.0 if x5["cvd_ok"] else 0.2) if x5["has_delta"] else None
+    comp["derivatives"] = deriv_frac(side, fm)
+    comp["momentum"] = 1.0 if mom else 0.3
+    comp["rr_quality"] = 1.0 if rr_eff >= 2.2 else 0.75 if rr_eff >= 1.8 else 0.5
+    comp["liquidity_target"] = 1.0 if lt else 0.5
+    comp["spread_quality"] = None if sp is None else (1.0 if sp < 0.03 else 0.6 if sp < 0.06 else 0.3)
+
+    def total(c):
+        num = den = 0.0
+        tags = []
+        for name, wgt in WEIGHTS.items():
+            fr = c.get(name)
+            if fr is None:
+                continue
+            f = tag_factor(tag_stats, name)
+            num += wgt * f * fr
+            den += wgt * f
+            if fr >= 0.6:
+                tags.append(name)
+        return (int(round(100 * num / den)) if den else 0), tags
+
+    pre_score, _ = total(comp)
+    p_win = est_win_prob(data, pre_score)
+    ev = p_win * rr_eff - (1 - p_win)
+    if ev < MIN_EV:
+        return _rej("expected value too low")
+    comp["ev_quality"] = 1.0 if ev >= 0.5 else 0.75 if ev >= 0.3 else 0.5
+    score, tags = total(comp)
+    if score < min_score:
+        return _rej(f"score below {min_score}")
+
+    brk = "MSS/CHOCH" if seq["kind"] == "CHOCH" else "BOS"
+    steps = [f"Sweep ({seq['level_name']})", "Displacement", brk, "+".join(seq["zones"]), "Retest", "Volume"]
     return {
-        "symbol": symbol,
-        "side": bias,
-        "entry": price,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "score": score,
-        "rank": score,
-        "tags": [k for k, ok in hits.items() if ok],
+        "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+        "score": score, "rank": score, "grade": "VERY STRONG" if score >= VERY_STRONG_SCORE else "STRONG",
+        "tags": tags, "regime": regime, "steps": steps,
+        "rr1": float(rr1n), "rr2": float(rr2n), "btc": btc4 or "n/a",
+        "funding": fnd, "adx": adx4,
         "time": int(time.time() * 1000),
     }
 
@@ -553,29 +1039,31 @@ def analyze(symbol):
 def signal_message(s):
     icon = "🟢🚀" if s["side"] == "LONG" else "🔴📉"
     name = s["symbol"][:-4] + "/USDT"
-    tag_map = {
-        "trend": "4H Trend", "structure": "1H BOS/Structure", "sweep": "Liquidity Sweep",
-        "zone": "FVG/Order Block", "entry": "5M Confirmation", "vwap": "VWAP Aligned",
-    }
-    tags_txt = ", ".join(tag_map[t] for t in s.get("tags", []) if t in tag_map)
+    tags_txt = ", ".join(TAG_LABELS[t] for t in s.get("tags", []) if t in TAG_LABELS)
+    steps_txt = " → ".join(s.get("steps", []))
 
     def pct(x):
         return f"{(x - s['entry']) / s['entry'] * 100:+.2f}%"
 
+    fnd = s.get("funding")
+    fnd_txt = f" | Funding: {fnd * 100:+.3f}%" if fnd is not None else ""
     return (
         f"<b>{icon} {s['side']} SIGNAL — {name}</b>\n"
-        f"⏱ Multi-Timeframe (4H→1H→15M→5M) Smart Money setup\n\n"
+        f"🏅 <b>{s.get('grade', 'STRONG')}</b> — Score <b>{s['score']}/100</b>\n\n"
         f"📍 <b>Entry:</b> {fmt_price(s['entry'])}\n"
         f"🛑 <b>Stop Loss:</b> {fmt_price(s['sl'])} <i>({pct(s['sl'])})</i>\n"
         f"🎯 <b>TP1:</b> {fmt_price(s['tp1'])} <i>({pct(s['tp1'])})</i>\n"
         f"🎯 <b>TP2:</b> {fmt_price(s['tp2'])} <i>({pct(s['tp2'])})</i>\n\n"
-        f"⚖️ <b>Risk:Reward:</b> 1:{TP1_RR:g} / 1:{TP2_RR:g}\n"
-        f"📈 <b>Signal Score:</b> {s['score']}/100\n"
-        f"✅ <b>Confirmed by:</b> {tags_txt}\n\n"
+        f"⚖️ <b>Net R:R:</b> {s.get('rr1', 0):.1f} / {s.get('rr2', 0):.1f} <i>(after fees &amp; spread)</i>\n"
+        f"🧩 <b>Setup:</b> {steps_txt}\n"
+        f"🌍 <b>Regime:</b> {s.get('regime', '-')} | BTC: {s.get('btc', 'n/a')}{fnd_txt}\n"
+        f"✅ <b>Confluence:</b> {tags_txt}\n\n"
         f"💡 Take half profit at TP1, then move SL to entry.\n"
         f"⚠️ Risk only 1-2% per trade, keep leverage low.\n\n"
         f"<i>Not financial advice.</i>"
     )
+
+
 
 
 # ============================================================
@@ -1149,6 +1637,9 @@ def load_data():
         "content_idx": 0,
         "tip_bag": {},
         "posted_news": [],
+        "history": [],
+        "sent_today": {},
+        "dom_hist": [],
     }
     if os.path.exists(DATA_FILE):
         try:
@@ -1274,6 +1765,12 @@ def check_open_signals(data):
                 header, color, badge = "Signal Expired", "#334155", "neutral"
                 text = f"<b>⏱ {header} — {name} {s['side']}</b>\nNo target reached within {EXPIRE_H}h."
             log_result(s, state)
+            data.setdefault("history", []).append({
+                "symbol": s["symbol"], "side": s["side"], "score": s.get("score"),
+                "tags": s.get("tags", []), "regime": s.get("regime"), "result": state,
+                "opened": int(s["time"] / 1000), "closed": int(time.time()), "day": today_key(),
+            })
+            data["history"] = data["history"][-1000:]
             full_text = text + "\n\n" + stats_line(data["stats"])
             img = _text_card(header, f"{name} {s['side']}", color, wrap=36, badge=badge)
             send_telegram_photo(img, full_text, reply_to_message_id=s.get("message_id"))
@@ -1287,8 +1784,22 @@ def check_open_signals(data):
 
 
 def scan_for_signals(data):
+    REJECTS.clear()
+    _FUT["ok"] = True
+    allowed, reason, min_score = protection_state(data)
+    if not allowed:
+        log(f"NO TRADE (protection): {reason}")
+        return
+    ctx = build_context(data)
+    if not ctx["ok"]:
+        log(f"NO TRADE (market conditions): {', '.join(ctx['reasons'])}")
+        return
+    log(f"Context: BTC 4H={ctx['btc_bias']} 1D={ctx['btc_1d']} ETH/BTC={ctx['eth_btc']} "
+        f"dom_change={ctx['dom_change']} mkt24h={ctx['mkt_change']} | min_score={min_score}")
+
     coins = get_top_coins()
-    log(f"Scan shuru: {len(coins)} coins (SMC multi-timeframe engine)")
+    log(f"Scan started: {len(coins)} coins (advanced SMC engine)")
+    tag_stats, reg_stats = adaptive_stats(data)
 
     now = time.time()
     open_syms = {s["symbol"] for s in data["open"]}
@@ -1299,7 +1810,7 @@ def scan_for_signals(data):
         if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
             continue
         try:
-            sig = analyze(sym)
+            sig = analyze(sym, ctx, data, min_score, tag_stats, reg_stats)
             if sig:
                 found.append(sig)
         except Exception as e:
@@ -1307,8 +1818,17 @@ def scan_for_signals(data):
         time.sleep(0.15)
 
     found.sort(key=lambda x: -x["rank"])
+    day = today_key()
+    sent_today = data.setdefault("sent_today", {})
+    quota = max(0, MAX_SIGNALS_PER_DAY - sent_today.get(day, 0))
+    same_dir = Counter(s["side"] for s in data["open"])
     sent = 0
-    for sig in found[:MAX_SIGNALS_PER_SCAN]:
+    for sig in found:
+        if sent >= min(MAX_SIGNALS_PER_SCAN, quota):
+            break
+        if same_dir[sig["side"]] >= MAX_SAME_DIR_OPEN:
+            log(f"Skip {sig['symbol']}: {MAX_SAME_DIR_OPEN} {sig['side']} signals already open (correlation protection)")
+            continue
         try:
             path = make_chart(sig["symbol"], f"{sig['symbol'][:-4]}/USDT - Entry Signal")
             msg_id = send_telegram_photo(path, signal_message(sig))
@@ -1319,10 +1839,16 @@ def scan_for_signals(data):
             sig["message_id"] = msg_id if isinstance(msg_id, int) else None
             data["open"].append(sig)
             data["last_sent"][sig["symbol"]] = now
+            sent_today[day] = sent_today.get(day, 0) + 1
+            same_dir[sig["side"]] += 1
             sent += 1
             save_data(data)
         time.sleep(1)
-    log(f"Scan khatam: {len(found)} setups mile, {sent} signals bheje")
+    for k in sorted(sent_today)[:-7]:
+        del sent_today[k]
+    top = ", ".join(f"{r} x{c}" for r, c in REJECTS.most_common(6))
+    log(f"Scan finished: {len(found)} setups passed, {sent} signals sent")
+    log(f"Top rejection reasons: {top or 'none'}")
 
 
 def run_once(force=False):
@@ -1332,10 +1858,10 @@ def run_once(force=False):
         check_new_listings(data)
     except Exception as e:
         log(f"New listing outer error: {e}")
-    hour_key = int(time.time() // 3600)
-    if force or data["last_scan_hour"] != hour_key:
+    # 15M/5M strategy ke liye har run (~15 min) scan hota hai (minimum 10 min gap)
+    if force or time.time() - data.get("last_scan_time", 0) >= 600:
         scan_for_signals(data)
-        data["last_scan_hour"] = hour_key
+        data["last_scan_time"] = time.time()
     save_data(data)
 
     if CONTENT_ENABLED:
