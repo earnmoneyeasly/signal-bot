@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 # ============================================================
 #  SETTINGS  (sirf ye 2 lines badalni hain)
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "YAHAN_APNA_BOT_TOKEN_LIKHO"   # PC/VPS par yahan token likho. GitHub par KABHI mat likho (Secrets use hota hai)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8954226044:AAFv9RThMlKxQjoUCU84wM6yWwP1EF4Wfac"   # PC/VPS par yahan token likho. GitHub par KABHI mat likho (Secrets use hota hai)
 CHAT_ID = os.getenv("CHAT_ID") or "@Strexx_Crypto_Signals"   # aap ka channel
 
 # ---- Advanced settings (chaho to chhor do) ----
