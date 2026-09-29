@@ -24,6 +24,7 @@ import json
 import csv
 import math
 import random
+import traceback
 from collections import Counter
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -347,15 +348,15 @@ def trend_of(df4):
 #  -> 0-100 score -> Anti-loss protection -> Adaptive learning
 # ============================================================
 
-MIN_SIGNAL_SCORE = 80      # 80 se neeche = NO SIGNAL
+MIN_SIGNAL_SCORE = 72      # 72 se neeche = NO SIGNAL
 VERY_STRONG_SCORE = 90     # 90+ = Very strong, 80-89 = Strong
 SWING_L = 2
 SWING_R = 2
 VOL_LOOKBACK = 100
 VOL_PCTL_MAX = 0.85        # ATR% is percentile se upar = high-volatility (no trade)
-ADX_MIN = 20               # trend strength minimum
-MIN_NET_RR = 1.5           # fees + spread ke baad expected R:R
-MIN_EV = 0.15              # expected value (R units) minimum
+ADX_MIN = 15               # trend strength minimum
+MIN_NET_RR = 1.15          # fees + spread ke baad expected R:R
+MIN_EV = 0.05              # expected value (R units) minimum
 MAX_SPREAD_PCT = 0.10
 FEE_PCT = 0.05             # per side (round trip = 2x)
 FUNDING_EXTREME = 0.0005   # 0.05% per 8h
@@ -714,7 +715,7 @@ def seq_long(m, sell_levels, a):
 
     # 1) Liquidity sweep
     best = None
-    for i in range(n - 3, max(n - 41, 10), -1):
+    for i in range(n - 3, max(n - 61, 10), -1):
         cands = list(sell_levels) + [("15m swing", p) for idx, p in sl if idx < i - 2][-3:]
         hit = None
         for name, lv in cands:
@@ -866,9 +867,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
 
     # ---- 2) Multi-timeframe: 1D bias, 1H structure ----
     df1d = get_klines(symbol, "1d", 120).iloc[:-1]
-    b1d = day_bias(df1d)
-    if b1d is not None and b1d != side:
-        return _rej("1D bias opposes 4H")
+    b1d = day_bias(df1d)  # ab hard-reject nahi, sirf score mein weight deta hai (neeche comp['htf_trend'])
     df1h = get_klines(symbol, "1h", 300).iloc[:-1]
     if len(df1h) < 100:
         return _rej("not enough 1H data")
@@ -936,7 +935,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     risk_pct = risk / abs(price_m) * 100
     if risk > 6.0 * a15v or risk_pct > 6.0:
         return _rej("structural stop too far")
-    if any(price_m < p < price_m + 1.0 * risk for p in blockers):
+    if any(price_m < p < price_m + 0.5 * risk for p in blockers):
         return _rej("major level blocks path to TP1")
     tp1_m = price_m + TP1_RR * risk
     lt = sorted(p for p in targets if price_m + 2.5 * risk <= p <= price_m + 6 * risk)
@@ -1804,18 +1803,28 @@ def scan_for_signals(data):
     now = time.time()
     open_syms = {s["symbol"] for s in data["open"]}
     found = []
+    checked = 0
+    errors = 0
+    first_tb = None
     for sym in coins:
         if sym in open_syms:
             continue
         if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
             continue
+        checked += 1
         try:
             sig = analyze(sym, ctx, data, min_score, tag_stats, reg_stats)
             if sig:
                 found.append(sig)
         except Exception as e:
+            errors += 1
+            if first_tb is None:
+                first_tb = traceback.format_exc()
             log(f"Analyze error {sym}: {e}")
         time.sleep(0.15)
+    log(f"Coins actually analyzed: {checked} | Exceptions: {errors}")
+    if first_tb:
+        log("First exception traceback:\n" + first_tb)
 
     found.sort(key=lambda x: -x["rank"])
     day = today_key()
