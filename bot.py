@@ -348,7 +348,8 @@ def trend_of(df4):
 #  -> 0-100 score -> Anti-loss protection -> Adaptive learning
 # ============================================================
 
-MIN_SIGNAL_SCORE = 72      # 72 se neeche = NO SIGNAL
+MIN_SIGNAL_SCORE = 60      # 60 se neeche = NO SIGNAL
+FALLBACK_MIN_SCORE = 55    # fallback (simple trend-pullback) setups ke liye alag, chhota threshold
 VERY_STRONG_SCORE = 90     # 90+ = Very strong, 80-89 = Strong
 SWING_L = 2
 SWING_R = 2
@@ -811,6 +812,35 @@ def seq_long(m, sell_levels, a):
     }
 
 
+def fallback_setup(m15, a15):
+    """Jab poori Sweep->Displacement->BOS->FVG/OB sequence na mile, tab simple
+    EMA20 pullback + bullish-close setup dhundta hai (LONG-space mein, SHORT ke liye
+    mirrored df aata hai). Isse bot kabhi bilkul khaali nahi rehta."""
+    c = m15["close"]
+    n = len(m15)
+    if n < 30:
+        return None
+    a15v = float(a15.iloc[-1])
+    e20 = ema(c, 20)
+    price = float(c.iloc[-1])
+    dist = abs(price - float(e20.iloc[-1]))
+    if dist > 2.5 * a15v:   # bohat door hai (chase) ya bohat gehra pullback, skip karo
+        return None
+    last3 = m15.tail(3)
+    if not bool((last3["close"] > last3["open"]).any()):
+        return None
+    extreme = float(m15["low"].tail(12).min())
+    vol_avg = m15["volume"].rolling(20).mean().iloc[-1]
+    disp_rv = float(m15["volume"].iloc[-1] / vol_avg) if vol_avg and vol_avg > 0 else 1.0
+    return {
+        "level_name": "EMA20 Pullback", "level_q": 0.55, "extreme": extreme,
+        "kind": "BOS", "zones": ["EMA20"], "zone": ("EMA20", extreme, price),
+        "discount": True, "ote": False, "failed_breakout": False,
+        "disp_ratio": 1.1, "disp_rv": disp_rv, "bull_close": bool(c.iloc[-1] > m15["open"].iloc[-1]),
+        "fallback": True,
+    }
+
+
 def five_min_confirm(df5, side):
     """5M execution: strong candle + relative volume + delta/CVD."""
     if len(df5) < 30:
@@ -845,6 +875,54 @@ def market_context_frac(side, symbol, ctx):
     return sum(votes) / len(votes) if votes else None
 
 
+def analyze_basic(symbol):
+    """Fallback: simple 4H trend + 1H momentum/volume signal, jab advanced SMC ko kuch na mile.
+    Grade 'BASIC' — kam sakht, jaldi signals deta hai (LONG aur SHORT dono, coin ke apne trend par)."""
+    try:
+        df4 = get_klines(symbol, "4h", 300).iloc[:-1]
+        side = trend_of(df4)
+        if side is None:
+            return None
+        df1h = get_klines(symbol, "1h", 300).iloc[:-1]
+        if len(df1h) < 60:
+            return None
+        c = df1h["close"]
+        e20 = ema(c, 20)
+        r = rsi(c)
+        macd_line = ema(c, 12) - ema(c, 26)
+        hist = macd_line - ema(macd_line, 9)
+        a = atr(df1h)
+        a_now = float(a.iloc[-1])
+        price = float(c.iloc[-1])
+        if a_now / price * 100 < MIN_ATR_PCT:
+            return None
+        vol_ratio = float((df1h["volume"] / df1h["volume"].rolling(20).mean()).iloc[-1])
+        if side == "LONG":
+            ok = hist.iloc[-1] > 0 and 40 <= r.iloc[-1] <= 72 and price > e20.iloc[-1]
+        else:
+            ok = hist.iloc[-1] < 0 and 28 <= r.iloc[-1] <= 60 and price < e20.iloc[-1]
+        if not ok:
+            return None
+        risk = 1.5 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+        score = 55 + min(15, vol_ratio * 8)
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(score), "rank": score, "grade": "BASIC",
+            "tags": ["htf_trend", "momentum", "volume_confirm"],
+            "regime": "bull" if side == "LONG" else "bear",
+            "steps": ["4H Trend", "1H Momentum", "Volume"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_basic error {symbol}: {e}")
+        return None
+
+
 def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     # ---- 1) Market regime (4H): bull/bear/sideways, trend strength, volatility ----
     df4 = get_klines(symbol, "4h", 300).iloc[:-1]
@@ -860,10 +938,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     n_r, w_r = reg_stats.get(regime, (0, 0))
     if n_r >= MIN_TRADES_FOR_ADAPT and w_r / n_r < 0.30:
         return _rej("regime underperforming (adaptive block)")
-    if symbol != "BTCUSDT":
-        dc = ctx.get("dom_change")
-        if dc is not None and ((side == "LONG" and dc > DOM_HARD) or (side == "SHORT" and dc < -DOM_HARD)):
-            return _rej("BTC dominance against trade")
+    # (dominance ab hard-reject nahi, comp['market_context'] mein soft factor hai)
 
     # ---- 2) Multi-timeframe: 1D bias, 1H structure ----
     df1d = get_klines(symbol, "1d", 120).iloc[:-1]
@@ -872,12 +947,9 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     if len(df1h) < 100:
         return _rej("not enough 1H data")
     structure_ok, choch = structure_check(df1h, side)
-    if choch:
-        return _rej("1H CHOCH against trend")
+    # (CHOCH aur BTC-correlation ab hard-reject nahi, comp['structure_1h']/['btc_context'] mein soft factor hain)
     btc4 = ctx.get("btc_bias")
     corr = corr_with_btc(df1h, ctx)
-    if symbol != "BTCUSDT" and btc4 and btc4 != side and corr is not None and corr >= 0.6:
-        return _rej("BTC direction opposes (correlated)")
 
     df15 = get_klines(symbol, "15m", 300).iloc[:-1]
     if len(df15) < 100:
@@ -910,7 +982,9 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     # ---- 4) Sweep -> Displacement -> BOS/CHOCH -> FVG/OB -> Retest ----
     seq = seq_long(m15, sell, a15)
     if seq is None:
-        return None
+        seq = fallback_setup(m15, a15)   # poori sequence nahi mili -> simple trend-pullback try karo
+        if seq is None:
+            return None
 
     # ---- 5) 5M execution + volume/order flow ----
     df5 = get_klines(symbol, "5m", 200).iloc[:-1]
@@ -963,8 +1037,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     # ---- 7) Derivatives: funding / OI / long-short ----
     fm = futures_metrics(symbol)
     fnd = fm["funding"]
-    if fnd is not None and ((side == "LONG" and fnd > FUNDING_EXTREME) or (side == "SHORT" and fnd < -FUNDING_EXTREME)):
-        return _rej("extreme funding against trade")
+    # (extreme funding ab hard-reject nahi, comp['derivatives'] mein already penalize hota hai)
 
     # ---- 8) Scoring (0-100) ----
     comp = {}
@@ -981,7 +1054,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     else:
         comp["btc_context"] = 0.3
     comp["market_context"] = market_context_frac(side, symbol, ctx)
-    comp["structure_1h"] = 1.0 if structure_ok else 0.3
+    comp["structure_1h"] = 0.25 if choch else (1.0 if structure_ok else 0.4)
     comp["sweep"] = seq["level_q"]
     comp["failed_breakout"] = 1.0 if seq["failed_breakout"] else 0.0
     comp["displacement"] = 1.0 if seq["disp_ratio"] >= 2.0 else 0.75 if seq["disp_ratio"] >= 1.6 else 0.55
@@ -1016,19 +1089,25 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     pre_score, _ = total(comp)
     p_win = est_win_prob(data, pre_score)
     ev = p_win * rr_eff - (1 - p_win)
-    if ev < MIN_EV:
-        return _rej("expected value too low")
-    comp["ev_quality"] = 1.0 if ev >= 0.5 else 0.75 if ev >= 0.3 else 0.5
+    # (EV gate abhi soft hai jab tak trade history kam ho, andaza unreliable hota hai)
+    comp["ev_quality"] = 1.0 if ev >= 0.5 else 0.75 if ev >= 0.3 else 0.5 if ev >= MIN_EV else 0.3
     score, tags = total(comp)
-    if score < min_score:
-        return _rej(f"score below {min_score}")
+    is_fallback = bool(seq.get("fallback"))
+    required = FALLBACK_MIN_SCORE if is_fallback else min_score
+    if score < required:
+        return _rej(f"score below {required}" + (" (fallback)" if is_fallback else ""))
 
-    brk = "MSS/CHOCH" if seq["kind"] == "CHOCH" else "BOS"
-    steps = [f"Sweep ({seq['level_name']})", "Displacement", brk, "+".join(seq["zones"]), "Retest", "Volume"]
+    if is_fallback:
+        steps = ["Trend + EMA20 Pullback", "Volume Confirm"]
+        grade = "TREND SETUP"
+    else:
+        brk = "MSS/CHOCH" if seq["kind"] == "CHOCH" else "BOS"
+        steps = [f"Sweep ({seq['level_name']})", "Displacement", brk, "+".join(seq["zones"]), "Retest", "Volume"]
+        grade = "VERY STRONG" if score >= VERY_STRONG_SCORE else "STRONG"
     return {
         "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-        "score": score, "rank": score, "grade": "VERY STRONG" if score >= VERY_STRONG_SCORE else "STRONG",
-        "tags": tags, "regime": regime, "steps": steps,
+        "score": score, "rank": score - (10 if is_fallback else 0), "grade": grade,
+        "tags": tags, "regime": regime, "steps": steps, "fallback": is_fallback,
         "rr1": float(rr1n), "rr2": float(rr2n), "btc": btc4 or "n/a",
         "funding": fnd, "adx": adx4,
         "time": int(time.time() * 1000),
@@ -1825,6 +1904,25 @@ def scan_for_signals(data):
     log(f"Coins actually analyzed: {checked} | Exceptions: {errors}")
     if first_tb:
         log("First exception traceback:\n" + first_tb)
+
+    # Fallback pass: advanced strategy bohat sakht hai, is liye agar wo signal na de
+    # to simpler trend+momentum ('BASIC') signals se gap bhara jata hai (LONG/SHORT dono).
+    adv_syms = {s["symbol"] for s in found}
+    if len(found) < MAX_SIGNALS_PER_SCAN:
+        basic_found = 0
+        for sym in coins:
+            if len(found) >= MAX_SIGNALS_PER_SCAN * 2:
+                break
+            if sym in open_syms or sym in adv_syms:
+                continue
+            if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
+                continue
+            sig = analyze_basic(sym)
+            if sig:
+                found.append(sig)
+                basic_found += 1
+            time.sleep(0.1)
+        log(f"Fallback (BASIC) pass added: {basic_found} signals")
 
     found.sort(key=lambda x: -x["rank"])
     day = today_key()
