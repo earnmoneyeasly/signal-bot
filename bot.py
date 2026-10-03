@@ -53,8 +53,8 @@ MIN_SCORE = 3            # 4 mein se kam az kam 3 conditions match hon
 VOL_MULT = 1.2           # volume average se 1.2x zyada
 MIN_ATR_PCT = 0.25       # bohat sust (flat) coins skip
 BTC_FILTER = False       # true karne se sirf BTC ke trend ki taraf ke signals aatay hain
-COOLDOWN_H = 8           # same coin par dobara signal 8 ghante baad
-MAX_SIGNALS_PER_SCAN = 3 # ek scan mein max signals (sab se strong)
+COOLDOWN_H = 6           # same coin+strategy par dobara signal 6 ghante baad
+MAX_SIGNALS_PER_SCAN = 6 # ek scan mein max signals (sab strategies milakar)
 EXPIRE_H = 48            # 48 ghante mein kuch na hua to signal band
 LOOP_SECONDS = 300       # bot har 5 minute mein check kare
 
@@ -363,7 +363,7 @@ FEE_PCT = 0.05             # per side (round trip = 2x)
 FUNDING_EXTREME = 0.0005   # 0.05% per 8h
 DOM_HARD = 0.8             # BTC dominance 24h change (pp) jis se upar/neeche alt trade block
 MAX_SAME_DIR_OPEN = 3      # ek direction mein max open signals (correlation protection)
-MAX_SIGNALS_PER_DAY = 5
+MAX_SIGNALS_PER_DAY = 15   # multi-strategy, is liye cap barha hai
 DAILY_MAX_LOSSES = 3
 LOSS_STREAK_COOLDOWN = 3   # itne consecutive losses ke baad cooldown
 LOSS_STREAK_COOLDOWN_H = 6
@@ -672,8 +672,8 @@ def protection_state(data):
 
 
 def adaptive_stats(data):
-    """History se: har condition (tag) aur har regime ka (trades, wins)."""
-    tag, reg = {}, {}
+    """History se: har condition (tag), regime, aur STRATEGY ka (trades, wins)."""
+    tag, reg, strat = {}, {}, {}
     for h in data.get("history", []):
         res = h.get("result")
         if res != "sl" and res not in WIN_RESULTS:
@@ -686,7 +686,23 @@ def adaptive_stats(data):
         if r:
             n, w = reg.get(r, (0, 0))
             reg[r] = (n + 1, w + win)
-    return tag, reg
+        st = h.get("strategy")
+        if st:
+            n, w = strat.get(st, (0, 0))
+            strat[st] = (n + 1, w + win)
+    return tag, reg, strat
+
+
+MIN_TRADES_FOR_STRAT_DISABLE = 15
+STRAT_DISABLE_WIN_RATE = 0.25   # is se kam win-rate wali strategy khud-ba-khud ruk jati hai
+
+
+def strategy_allowed(strat_stats, name):
+    """Agar kisi strategy ka live win-rate bohat kharab ho (15+ trades ke baad), use khud band kar do."""
+    n, w = strat_stats.get(name, (0, 0))
+    if n < MIN_TRADES_FOR_STRAT_DISABLE:
+        return True
+    return (w / n) >= STRAT_DISABLE_WIN_RATE
 
 
 def tag_factor(tag_stats, name):
@@ -911,7 +927,7 @@ def analyze_basic(symbol):
         score = 55 + min(15, vol_ratio * 8)
         return {
             "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "score": int(score), "rank": score, "grade": "BASIC",
+            "score": int(score), "rank": score, "grade": "BASIC", "strategy": "B",
             "tags": ["htf_trend", "momentum", "volume_confirm"],
             "regime": "bull" if side == "LONG" else "bear",
             "steps": ["4H Trend", "1H Momentum", "Volume"],
@@ -920,6 +936,50 @@ def analyze_basic(symbol):
         }
     except Exception as e:
         log(f"analyze_basic error {symbol}: {e}")
+        return None
+
+
+def analyze_breakout(symbol):
+    """Teesri strategy: 15M range breakout + volume spike. Sab se zyada signal-frequency wali, kam sakht."""
+    try:
+        df15 = get_klines(symbol, "15m", 120).iloc[:-1]
+        if len(df15) < 40:
+            return None
+        window = df15.iloc[-21:-1]
+        recent_high, recent_low = float(window["high"].max()), float(window["low"].min())
+        last = df15.iloc[-1]
+        avg_vol = df15["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(last["volume"] / avg_vol) if avg_vol else 0
+        a15 = atr(df15)
+        a_now = float(a15.iloc[-1])
+        price = float(last["close"])
+        if a_now / price * 100 < MIN_ATR_PCT:
+            return None
+        if vol_ratio < VOL_MULT:
+            return None
+        if last["close"] > recent_high and last["close"] > last["open"]:
+            side = "LONG"
+        elif last["close"] < recent_low and last["close"] < last["open"]:
+            side = "SHORT"
+        else:
+            return None
+        risk = 1.3 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+        score = 50 + min(20, vol_ratio * 6)
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(score), "rank": score, "grade": "BREAKOUT", "strategy": "C",
+            "tags": ["displacement", "volume_confirm"],
+            "regime": "bull" if side == "LONG" else "bear",
+            "steps": ["15M Range Break", "Volume Spike"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_breakout error {symbol}: {e}")
         return None
 
 
@@ -1107,6 +1167,7 @@ def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     return {
         "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
         "score": score, "rank": score - (10 if is_fallback else 0), "grade": grade,
+        "strategy": "A",
         "tags": tags, "regime": regime, "steps": steps, "fallback": is_fallback,
         "rr1": float(rr1n), "rr2": float(rr2n), "btc": btc4 or "n/a",
         "funding": fnd, "adx": adx4,
@@ -1127,7 +1188,8 @@ def signal_message(s):
     fnd_txt = f" | Funding: {fnd * 100:+.3f}%" if fnd is not None else ""
     return (
         f"<b>{icon} {s['side']} SIGNAL — {name}</b>\n"
-        f"🏅 <b>{s.get('grade', 'STRONG')}</b> — Score <b>{s['score']}/100</b>\n\n"
+        f"🏅 <b>{s.get('grade', 'STRONG')}</b> — Score <b>{s['score']}/100</b> "
+        f"— <i>{s.get('strategy', 'Strategy')}</i>\n\n"
         f"📍 <b>Entry:</b> {fmt_price(s['entry'])}\n"
         f"🛑 <b>Stop Loss:</b> {fmt_price(s['sl'])} <i>({pct(s['sl'])})</i>\n"
         f"🎯 <b>TP1:</b> {fmt_price(s['tp1'])} <i>({pct(s['tp1'])})</i>\n"
@@ -1809,13 +1871,14 @@ def check_open_signals(data):
             still_open.append(s)
             continue
 
+        strat = s.get("strategy", "Strategy")
         if state == "open":
             still_open.append(s)
         elif state == "tp1":
             if not s.get("tp1_notified"):
                 s["tp1_notified"] = True
                 text = (
-                    f"<b>🎯 TP1 HIT — {name} {s['side']}</b>\n\n"
+                    f"<b>🎯 TP1 HIT — {name} {s['side']}</b> <i>({strat})</i>\n\n"
                     f"Move SL to <b>entry ({fmt_price(s['entry'])})</b> now. Risk-free trade! 🛡️"
                 )
                 img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#15803d", wrap=36, badge="win")
@@ -1825,27 +1888,27 @@ def check_open_signals(data):
             if state == "sl":
                 data["stats"]["losses"] += 1
                 header, color, badge = "Stop Loss Hit", "#7f1d1d", "loss"
-                text = f"<b>❌ {header} — {name} {s['side']}</b>"
+                text = f"<b>❌ {header} — {name} {s['side']}</b> <i>({strat})</i>"
             elif state == "tp2":
                 data["stats"]["wins"] += 1
                 header, color, badge = "TP2 Hit - Full Target", "#166534", "win"
-                text = f"<b>🏆 {header} — {name} {s['side']}</b> ✅✅"
+                text = f"<b>🏆 {header} — {name} {s['side']}</b> <i>({strat})</i> ✅✅"
             elif state == "be":
                 data["stats"]["wins"] += 1
                 header, color, badge = "Closed at Breakeven", "#14532d", "win"
-                text = f"<b>✅ {header} — {name} {s['side']}</b>\nTP1 was reached, then closed at entry."
+                text = f"<b>✅ {header} — {name} {s['side']}</b> <i>({strat})</i>\nTP1 was reached, then closed at entry."
             elif state == "tp1_close":
                 data["stats"]["wins"] += 1
                 header, color, badge = "Closed after TP1", "#166534", "win"
-                text = f"<b>✅ {header} — {name} {s['side']}</b>\nClosed on time-out."
+                text = f"<b>✅ {header} — {name} {s['side']}</b> <i>({strat})</i>\nClosed on time-out."
             else:  # expired
                 data["stats"]["expired"] += 1
                 header, color, badge = "Signal Expired", "#334155", "neutral"
-                text = f"<b>⏱ {header} — {name} {s['side']}</b>\nNo target reached within {EXPIRE_H}h."
+                text = f"<b>⏱ {header} — {name} {s['side']}</b> <i>({strat})</i>\nNo target reached within {EXPIRE_H}h."
             log_result(s, state)
             data.setdefault("history", []).append({
                 "symbol": s["symbol"], "side": s["side"], "score": s.get("score"),
-                "tags": s.get("tags", []), "regime": s.get("regime"), "result": state,
+                "strategy": strat, "tags": s.get("tags", []), "regime": s.get("regime"), "result": state,
                 "opened": int(s["time"] / 1000), "closed": int(time.time()), "day": today_key(),
             })
             data["history"] = data["history"][-1000:]
@@ -1862,6 +1925,8 @@ def check_open_signals(data):
 
 
 def scan_for_signals(data):
+    """Multi-strategy scan: har coin par registered saari strategies chalti hain.
+    Jo bhi strategy signal de, wo post hoti hai — 1 strategy bole to 1 post, 2 bolein to 2 post, waghera."""
     REJECTS.clear()
     _FUT["ok"] = True
     allowed, reason, min_score = protection_state(data)
@@ -1876,65 +1941,61 @@ def scan_for_signals(data):
         f"dom_change={ctx['dom_change']} mkt24h={ctx['mkt_change']} | min_score={min_score}")
 
     coins = get_top_coins()
-    log(f"Scan started: {len(coins)} coins (advanced SMC engine)")
-    tag_stats, reg_stats = adaptive_stats(data)
+    tag_stats, reg_stats, strat_stats = adaptive_stats(data)
+
+    STRATEGIES = [
+        ("A", lambda sym: analyze(sym, ctx, data, min_score, tag_stats, reg_stats)),
+        ("B", lambda sym: analyze_basic(sym)),
+        ("C", lambda sym: analyze_breakout(sym)),
+    ]
+    active = [(n, f) for n, f in STRATEGIES if strategy_allowed(strat_stats, n)]
+    skipped = [n for n, _ in STRATEGIES if n not in dict(active)]
+    if skipped:
+        log(f"Strategy auto-disabled (poor live win-rate): {', '.join(skipped)}")
+    log(f"Scan started: {len(coins)} coins x {len(active)} strategies "
+        f"({', '.join(n for n, _ in active)})")
 
     now = time.time()
-    open_syms = {s["symbol"] for s in data["open"]}
+    open_keys = {(s["symbol"], s.get("strategy")) for s in data["open"]}
     found = []
     checked = 0
     errors = 0
     first_tb = None
     for sym in coins:
-        if sym in open_syms:
-            continue
-        if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
-            continue
-        checked += 1
-        try:
-            sig = analyze(sym, ctx, data, min_score, tag_stats, reg_stats)
-            if sig:
-                found.append(sig)
-        except Exception as e:
-            errors += 1
-            if first_tb is None:
-                first_tb = traceback.format_exc()
-            log(f"Analyze error {sym}: {e}")
-        time.sleep(0.15)
-    log(f"Coins actually analyzed: {checked} | Exceptions: {errors}")
+        for strat_name, strat_fn in active:
+            key = f"{sym}|{strat_name}"
+            if (sym, strat_name) in open_keys:
+                continue
+            if now - data["last_sent"].get(key, 0) < COOLDOWN_H * 3600:
+                continue
+            checked += 1
+            try:
+                sig = strat_fn(sym)
+                if sig:
+                    found.append(sig)
+            except Exception as e:
+                errors += 1
+                if first_tb is None:
+                    first_tb = traceback.format_exc()
+                log(f"Analyze error {sym} [{strat_name}]: {e}")
+            time.sleep(0.1)
+    log(f"Coin-strategy checks: {checked} | Exceptions: {errors}")
     if first_tb:
         log("First exception traceback:\n" + first_tb)
-
-    # Fallback pass: advanced strategy bohat sakht hai, is liye agar wo signal na de
-    # to simpler trend+momentum ('BASIC') signals se gap bhara jata hai (LONG/SHORT dono).
-    adv_syms = {s["symbol"] for s in found}
-    if len(found) < MAX_SIGNALS_PER_SCAN:
-        basic_found = 0
-        for sym in coins:
-            if len(found) >= MAX_SIGNALS_PER_SCAN * 2:
-                break
-            if sym in open_syms or sym in adv_syms:
-                continue
-            if now - data["last_sent"].get(sym, 0) < COOLDOWN_H * 3600:
-                continue
-            sig = analyze_basic(sym)
-            if sig:
-                found.append(sig)
-                basic_found += 1
-            time.sleep(0.1)
-        log(f"Fallback (BASIC) pass added: {basic_found} signals")
 
     found.sort(key=lambda x: -x["rank"])
     day = today_key()
     sent_today = data.setdefault("sent_today", {})
     quota = max(0, MAX_SIGNALS_PER_DAY - sent_today.get(day, 0))
     same_dir = Counter(s["side"] for s in data["open"])
+    by_strategy = Counter()
     sent = 0
     for sig in found:
         if sent >= min(MAX_SIGNALS_PER_SCAN, quota):
             break
         if same_dir[sig["side"]] >= MAX_SAME_DIR_OPEN:
-            log(f"Skip {sig['symbol']}: {MAX_SAME_DIR_OPEN} {sig['side']} signals already open (correlation protection)")
+            log(f"Skip {sig['symbol']} [{sig.get('strategy')}]: {MAX_SAME_DIR_OPEN} {sig['side']} "
+                f"signals already open (correlation protection)")
             continue
         try:
             path = make_chart(sig["symbol"], f"{sig['symbol'][:-4]}/USDT - Entry Signal")
@@ -1945,16 +2006,18 @@ def scan_for_signals(data):
         if msg_id:
             sig["message_id"] = msg_id if isinstance(msg_id, int) else None
             data["open"].append(sig)
-            data["last_sent"][sig["symbol"]] = now
+            data["last_sent"][f"{sig['symbol']}|{sig.get('strategy')}"] = now
             sent_today[day] = sent_today.get(day, 0) + 1
             same_dir[sig["side"]] += 1
+            by_strategy[sig.get("strategy")] += 1
             sent += 1
             save_data(data)
         time.sleep(1)
     for k in sorted(sent_today)[:-7]:
         del sent_today[k]
     top = ", ".join(f"{r} x{c}" for r, c in REJECTS.most_common(6))
-    log(f"Scan finished: {len(found)} setups passed, {sent} signals sent")
+    breakdown = ", ".join(f"{n} x{c}" for n, c in by_strategy.items())
+    log(f"Scan finished: {len(found)} setups passed, {sent} signals sent ({breakdown or 'none'})")
     log(f"Top rejection reasons: {top or 'none'}")
 
 
