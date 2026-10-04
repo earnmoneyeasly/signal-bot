@@ -390,6 +390,8 @@ TAG_LABELS = {
     "vwap": "VWAP", "cvd_delta": "CVD/Delta", "derivatives": "OI/Funding/LS",
     "momentum": "Momentum", "rr_quality": "Good R:R", "liquidity_target": "Liquidity Target",
     "spread_quality": "Tight Spread", "ev_quality": "Positive EV",
+    "ema_stack": "4-EMA Bias", "rsi_extreme": "RSI Extreme", "sr_level": "S/R Level",
+    "trendline": "Trendline", "ema_sr": "EMA S/R Confluence",
 }
 LEVEL_Q = {"PWL": 1.0, "PWH": 1.0, "PDL": 1.0, "PDH": 1.0, "EQL": 0.9, "EQH": 0.9,
            "1H swing": 0.7, "15m swing": 0.6}
@@ -939,47 +941,108 @@ def analyze_basic(symbol):
         return None
 
 
-def analyze_breakout(symbol):
-    """Teesri strategy: 15M range breakout + volume spike. Sab se zyada signal-frequency wali, kam sakht."""
+def analyze_d(symbol):
+    """Strategy D: classic technical analysis.
+    - 4-EMA stack (9/13/21/55) = bullish/bearish bias
+    - 4-EMA (10/50/100/200) = support/resistance confluence (price must be on the right side)
+    - Swing-based S/R lines; a level touched 3+ times aur phir break hone par 'breakout' confirm
+    - Trendline (linear regression slope) harmony
+    - Classic RSI: >=70 overbought (sell/short bias), <=30 oversold (buy/long bias)
+    Entry tab hi, jab EMA-stack bias + trendline match karein, AUR (S/R breakout YA RSI extreme) mein se
+    kam az kam ek trigger mile."""
     try:
-        df15 = get_klines(symbol, "15m", 120).iloc[:-1]
-        if len(df15) < 40:
+        df = get_klines(symbol, "1h", 300).iloc[:-1]
+        if len(df) < 210:
             return None
-        window = df15.iloc[-21:-1]
-        recent_high, recent_low = float(window["high"].max()), float(window["low"].min())
-        last = df15.iloc[-1]
-        avg_vol = df15["volume"].rolling(20).mean().iloc[-1]
-        vol_ratio = float(last["volume"] / avg_vol) if avg_vol else 0
-        a15 = atr(df15)
-        a_now = float(a15.iloc[-1])
-        price = float(last["close"])
-        if a_now / price * 100 < MIN_ATR_PCT:
-            return None
-        if vol_ratio < VOL_MULT:
-            return None
-        if last["close"] > recent_high and last["close"] > last["open"]:
+        c = df["close"]
+        price = float(c.iloc[-1])
+
+        # 1) 4-EMA bullish/bearish stack
+        e9, e13, e21, e55 = ema(c, 9).iloc[-1], ema(c, 13).iloc[-1], ema(c, 21).iloc[-1], ema(c, 55).iloc[-1]
+        if e9 > e13 > e21 > e55:
             side = "LONG"
-        elif last["close"] < recent_low and last["close"] < last["open"]:
+        elif e9 < e13 < e21 < e55:
             side = "SHORT"
         else:
+            return None  # EMAs tangled = no clear bias
+
+        # 2) 4-EMA (10/50/100/200) as support/resistance confluence
+        sr_emas = [ema(c, n).iloc[-1] for n in (10, 50, 100, 200)]
+        on_side = sum(1 for v in sr_emas if (price > v if side == "LONG" else price < v))
+        if on_side < 3:
+            return None  # price EMA S/R lines ke sahi taraf nahi
+
+        # 3) Support/Resistance: swing levels jo 3+ baar touch hui hon
+        a = atr(df)
+        a_now = float(a.iloc[-1])
+        if a_now / price * 100 < MIN_ATR_PCT:
             return None
-        risk = 1.3 * a_now
+        tol = max(a_now * 0.3, price * 0.0015)
+        sh, sl_pts = find_swings(df.tail(150).reset_index(drop=True))
+
+        def cluster(points):
+            out = []
+            for _, v in sorted(points, key=lambda x: x[1]):
+                merged = False
+                for cl in out:
+                    if abs(v - cl["level"]) <= tol:
+                        cl["level"] = (cl["level"] * cl["count"] + v) / (cl["count"] + 1)
+                        cl["count"] += 1
+                        merged = True
+                        break
+                if not merged:
+                    out.append({"level": v, "count": 1})
+            return out
+
+        res_levels = cluster(sh)
+        sup_levels = cluster(sl_pts)
+        strong_res = [lv for lv in res_levels if lv["count"] >= 3]
+        strong_sup = [lv for lv in sup_levels if lv["count"] >= 3]
+
+        breakout = False
+        if side == "LONG":
+            breakout = any(price > lv["level"] and (price - lv["level"]) <= 2 * a_now for lv in strong_res)
+        else:
+            breakout = any(price < lv["level"] and (lv["level"] - price) <= 2 * a_now for lv in strong_sup)
+
+        # 4) Classic RSI 30/70
+        r = rsi(c)
+        rsi_now = float(r.iloc[-1])
+        rsi_trigger = (rsi_now <= 30) if side == "LONG" else (rsi_now >= 70)
+
+        if not (breakout or rsi_trigger):
+            return None  # na breakout mila, na RSI extreme — entry trigger nahi
+
+        # 5) Trendline: recent closes ka regression slope bias ke sath match hona chahiye
+        tail = c.tail(50).values
+        slope = float(np.polyfit(range(len(tail)), tail, 1)[0])
+        trend_ok = (slope > 0) if side == "LONG" else (slope < 0)
+        if not trend_ok:
+            return None
+
+        risk = 1.5 * a_now
         if side == "LONG":
             sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
         else:
             sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
-        score = 50 + min(20, vol_ratio * 6)
+
+        score = 55 + (15 if breakout else 0) + (10 if rsi_trigger else 0) + (5 if on_side == 4 else 0)
+        steps = [f"EMA Stack ({'Bullish' if side == 'LONG' else 'Bearish'})"]
+        if breakout:
+            steps.append("S/R Breakout (3+ touches)")
+        if rsi_trigger:
+            steps.append(f"RSI {'Oversold' if side == 'LONG' else 'Overbought'} ({rsi_now:.0f})")
+        steps.append("Trendline")
+
         return {
             "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "score": int(score), "rank": score, "grade": "BREAKOUT", "strategy": "C",
-            "tags": ["displacement", "volume_confirm"],
-            "regime": "bull" if side == "LONG" else "bear",
-            "steps": ["15M Range Break", "Volume Spike"],
-            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "score": int(min(score, 90)), "rank": score, "grade": "CLASSIC TA", "strategy": "D",
+            "tags": ["htf_trend", "momentum"], "regime": "bull" if side == "LONG" else "bear",
+            "steps": steps, "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
             "time": int(time.time() * 1000),
         }
     except Exception as e:
-        log(f"analyze_breakout error {symbol}: {e}")
+        log(f"analyze_d error {symbol}: {e}")
         return None
 
 
@@ -1947,6 +2010,7 @@ def scan_for_signals(data):
         ("A", lambda sym: analyze(sym, ctx, data, min_score, tag_stats, reg_stats)),
         ("B", lambda sym: analyze_basic(sym)),
         ("C", lambda sym: analyze_breakout(sym)),
+        ("D", lambda sym: analyze_d(sym)),
     ]
     active = [(n, f) for n, f in STRATEGIES if strategy_allowed(strat_stats, n)]
     skipped = [n for n, _ in STRATEGIES if n not in dict(active)]
