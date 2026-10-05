@@ -1046,6 +1046,164 @@ def analyze_d(symbol):
         return None
 
 
+def analyze_e(symbol):
+    """Strategy E: 1-minute chart, EMA 20 vs EMA 200 crossover.
+    EMA20 upar EMA200 se -> Bullish (LONG). EMA20 neeche EMA200 se -> Bearish (SHORT).
+    Signal sirf tab trigger hota hai jab cross TAAZA (last 5 minutes mein) hua ho, taake
+    hamesha same-state ka pura din signal na aata rahe — sirf fresh cross report hoti hai."""
+    try:
+        df = get_klines(symbol, "1m", 300).iloc[:-1]
+        if len(df) < 210:
+            return None
+        c = df["close"]
+        e20 = ema(c, 20)
+        e200 = ema(c, 200)
+        diff = e20 - e200
+        last_diff = float(diff.iloc[-1])
+        prev_diff = float(diff.iloc[-6])  # ~5 minute pehle
+
+        crossed_up = prev_diff <= 0 and last_diff > 0
+        crossed_down = prev_diff >= 0 and last_diff < 0
+        if not (crossed_up or crossed_down):
+            return None  # koi taaza cross nahi hua
+        side = "LONG" if crossed_up else "SHORT"
+
+        price = float(c.iloc[-1])
+        a = atr(df)
+        a_now = float(a.iloc[-1])
+        if a_now <= 0 or a_now / price * 100 < MIN_ATR_PCT:
+            return None  # market bohat flat/dead hai (1m par noise se bachne ke liye)
+
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(df["volume"].iloc[-1] / avg_vol) if avg_vol else 0
+
+        # 1m noise se bachne ke liye thora wider stop (2x ATR, normal strategies se zyada)
+        risk = 2.0 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+
+        gap_strength = min(15, abs(last_diff) / price * 100 * 50)
+        score = 50 + (15 if vol_ratio >= 1.3 else 0) + gap_strength
+
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(min(score, 85)), "rank": score, "grade": "EMA CROSS", "strategy": "E",
+            "tags": ["momentum", "volume_confirm"], "regime": "bull" if side == "LONG" else "bear",
+            "steps": [f"EMA20 crossed {'above' if side == 'LONG' else 'below'} EMA200 (1m)"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_e error {symbol}: {e}")
+        return None
+
+
+def analyze_f(symbol):
+    """Strategy F: 15-minute chart, EMA 55 vs EMA 300 crossover.
+    EMA55 upar EMA300 se -> Bullish (LONG). EMA55 neeche EMA300 se -> Bearish (SHORT).
+    Sirf taaza cross (pichle ~90 minute mein) par signal deta hai, state par nahi."""
+    try:
+        df = get_klines(symbol, "15m", 500).iloc[:-1]
+        if len(df) < 320:
+            return None
+        c = df["close"]
+        e55 = ema(c, 55)
+        e300 = ema(c, 300)
+        diff = e55 - e300
+        last_diff = float(diff.iloc[-1])
+        prev_diff = float(diff.iloc[-6])  # ~90 minute pehle
+
+        crossed_up = prev_diff <= 0 and last_diff > 0
+        crossed_down = prev_diff >= 0 and last_diff < 0
+        if not (crossed_up or crossed_down):
+            return None
+        side = "LONG" if crossed_up else "SHORT"
+
+        price = float(c.iloc[-1])
+        a = atr(df)
+        a_now = float(a.iloc[-1])
+        if a_now <= 0 or a_now / price * 100 < MIN_ATR_PCT:
+            return None
+
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(df["volume"].iloc[-1] / avg_vol) if avg_vol else 0
+
+        risk = 1.5 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+
+        gap_strength = min(15, abs(last_diff) / price * 100 * 30)
+        score = 50 + (15 if vol_ratio >= 1.3 else 0) + gap_strength
+
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(min(score, 85)), "rank": score, "grade": "EMA CROSS 15M", "strategy": "F",
+            "tags": ["momentum", "volume_confirm"], "regime": "bull" if side == "LONG" else "bear",
+            "steps": [f"EMA55 crossed {'above' if side == 'LONG' else 'below'} EMA300 (15m)"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_f error {symbol}: {e}")
+        return None
+
+
+def analyze_f(symbol):
+    """Strategy F: 15-minute chart, EMA 55 vs EMA 300 crossover.
+    EMA55 upar EMA300 se -> Bullish (LONG). EMA55 neeche EMA300 se -> Bearish (SHORT).
+    Sirf taaza cross (last ~75 minutes) par signal, warna hamesha ek hi state baar baar nahi aati."""
+    try:
+        df = get_klines(symbol, "15m", 400).iloc[:-1]
+        if len(df) < 310:
+            return None
+        c = df["close"]
+        e55 = ema(c, 55)
+        e300 = ema(c, 300)
+        diff = e55 - e300
+        last_diff = float(diff.iloc[-1])
+        prev_diff = float(diff.iloc[-6])  # ~75 minute pehle
+
+        crossed_up = prev_diff <= 0 and last_diff > 0
+        crossed_down = prev_diff >= 0 and last_diff < 0
+        if not (crossed_up or crossed_down):
+            return None
+        side = "LONG" if crossed_up else "SHORT"
+
+        price = float(c.iloc[-1])
+        a = atr(df)
+        a_now = float(a.iloc[-1])
+        if a_now <= 0 or a_now / price * 100 < MIN_ATR_PCT:
+            return None
+
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(df["volume"].iloc[-1] / avg_vol) if avg_vol else 0
+
+        risk = 1.8 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+
+        gap_strength = min(15, abs(last_diff) / price * 100 * 30)
+        score = 50 + (15 if vol_ratio >= 1.3 else 0) + gap_strength
+
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(min(score, 85)), "rank": score, "grade": "EMA CROSS", "strategy": "F",
+            "tags": ["momentum", "volume_confirm"], "regime": "bull" if side == "LONG" else "bear",
+            "steps": [f"EMA55 crossed {'above' if side == 'LONG' else 'below'} EMA300 (15m)"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_f error {symbol}: {e}")
+        return None
+
+
 def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     # ---- 1) Market regime (4H): bull/bear/sideways, trend strength, volatility ----
     df4 = get_klines(symbol, "4h", 300).iloc[:-1]
@@ -2011,6 +2169,8 @@ def scan_for_signals(data):
         ("B", lambda sym: analyze_basic(sym)),
         ("C", lambda sym: analyze_breakout(sym)),
         ("D", lambda sym: analyze_d(sym)),
+        ("E", lambda sym: analyze_e(sym)),
+        ("F", lambda sym: analyze_f(sym)),
     ]
     active = [(n, f) for n, f in STRATEGIES if strategy_allowed(strat_stats, n)]
     skipped = [n for n, _ in STRATEGIES if n not in dict(active)]
