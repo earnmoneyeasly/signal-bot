@@ -189,6 +189,29 @@ def send_telegram_photo(path, caption, parse_mode="HTML", reply_to_message_id=No
         return None
 
 
+def send_telegram_poll(question, options, is_anonymous=True):
+    """Telegram ka native poll bhejta hai (buttons ke sath). Kamyabi par message_id, warna None."""
+    if BOT_TOKEN.startswith("YAHAN"):
+        print(f"\n[DRY RUN - poll] {question} | {options}\n")
+        return True
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPoll",
+            data={
+                "chat_id": CHAT_ID, "question": question, "options": json.dumps(options),
+                "is_anonymous": is_anonymous,
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            log(f"Telegram poll error: {r.status_code} {r.text}")
+            return None
+        return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log(f"Telegram poll error: {e}")
+        return None
+
+
 def make_chart(symbol, title):
     """1H candles ka simple price+EMA chart banata hai, PNG file ka path return karta hai."""
     df = get_klines(symbol, "1h", 100).iloc[:-1]
@@ -1832,7 +1855,7 @@ RISK_TIPS = [
 
 CONTENT_SEQUENCE = [
     "overview", "technical", "education", "coin", "psychology",
-    "news", "risk", "gainers", "summary",
+    "news", "risk", "gainers", "poll", "summary",
 ]
 
 TIP_STYLES = {
@@ -1979,6 +2002,20 @@ def post_daily_summary(data):
         log(f"Summary error: {e}")
 
 
+def post_btc_poll(data):
+    """Hafte mein ek baar: BTC is hafte Up jayega ya Down, Telegram ka native poll."""
+    last = data.get("last_poll_time", 0)
+    if time.time() - last < 7 * 24 * 3600:
+        log("BTC poll: skip, 7 din abhi nahi huay")
+        return
+    question = "📊🤔 Is hafte BTC kidhar jayega?"
+    options = ["🚀📈🟢 UP", "🐻📉🔴 DOWN"]
+    msg_id = send_telegram_poll(question, options)
+    if msg_id:
+        data["last_poll_time"] = time.time()
+        log("BTC poll posted")
+
+
 def post_gainers_losers():
     try:
         if datetime.now(timezone.utc).weekday() != 0:  # sirf Monday = weekly
@@ -2065,6 +2102,8 @@ def post_content(data):
             post_daily_summary(data)
         elif kind == "gainers":
             post_gainers_losers()
+        elif kind == "poll":
+            post_btc_poll(data)
         elif kind == "education":
             post_tip(data, "education")
         elif kind == "psychology":
@@ -2093,6 +2132,7 @@ def load_data():
         "history": [],
         "sent_today": {},
         "dom_hist": [],
+        "last_poll_time": 0,
     }
     if os.path.exists(DATA_FILE):
         try:
