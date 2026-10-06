@@ -285,6 +285,98 @@ def _text_card(header, body, bg_color, footer="STREXX CRYPTO SIGNALS", wrap=42, 
     return CHART_FILE
 
 
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}H {m}M {s}S"
+    if m:
+        return f"{m}M {s}S"
+    return f"{s}S"
+
+
+def make_profit_card(symbol, side, entry, exit_price, duration_s):
+    """Profit-showcase card (TP hit ke liye) — apna branding (Strexx Crypto Master) ke sath,
+    Binance ke rasmi (trademarked) logo ki jagah Binance jaisi gold/black color-scheme wala
+    generic mark istimal karta hai."""
+    name = symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
+    pct = (exit_price - entry) / entry * 100
+    if side == "SHORT":
+        pct = -pct
+    pct_txt = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
+    pct_color = "#22c55e" if pct >= 0 else "#ef4444"
+    side_color = "#22c55e" if side == "LONG" else "#ef4444"
+
+    from matplotlib.patches import FancyBboxPatch, RegularPolygon
+
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+    fig.patch.set_facecolor("#0b0e11")
+    ax.set_facecolor("#0b0e11")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    # --- top-left branding: Strexx Crypto Master ---
+    ax.add_patch(FancyBboxPatch((0.045, 0.885), 0.045, 0.06, boxstyle="round,pad=0.006,rounding_size=0.02",
+                                 linewidth=0, facecolor="#22c55e", transform=ax.transAxes, zorder=5))
+    ax.text(0.105, 0.915, "Strexx Crypto Master", fontsize=15, fontweight="bold", color="white",
+            va="center", ha="left", transform=ax.transAxes, zorder=5)
+
+    # --- symbol | side badge (exact width renderer se naapi jati hai, taake overlap na ho) ---
+    name_txt = ax.text(0.05, 0.775, name, fontsize=22, fontweight="bold", color="white",
+                        va="center", ha="left", transform=ax.transAxes, zorder=5)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    inv = ax.transAxes.inverted()
+    name_end_x = name_txt.get_window_extent(renderer=renderer).transformed(inv).x1
+
+    side_label = side.capitalize()
+    badge_x = name_end_x + 0.035
+    side_txt = ax.text(0, 0, side_label, fontsize=16, fontweight="bold", color=side_color, alpha=0)
+    fig.canvas.draw()
+    side_w = side_txt.get_window_extent(renderer=renderer).transformed(inv).width
+    side_txt.remove()
+    pad = 0.018
+    badge_w = side_w + 2 * pad
+    ax.add_patch(FancyBboxPatch((badge_x, 0.745), badge_w, 0.065, boxstyle="round,pad=0.004,rounding_size=0.018",
+                                 linewidth=1.3, edgecolor=side_color, facecolor=side_color, alpha=0.18,
+                                 transform=ax.transAxes, zorder=4))
+    ax.text(badge_x + badge_w / 2, 0.778, side_label, fontsize=16, fontweight="bold", color=side_color,
+            va="center", ha="center", transform=ax.transAxes, zorder=5)
+
+    # --- big profit percentage ---
+    ax.text(0.05, 0.56, pct_txt, fontsize=50, fontweight="bold", color=pct_color,
+            va="center", ha="left", transform=ax.transAxes, zorder=5)
+
+    # --- entry / last price / duration rows ---
+    rows = [("Entry Price", fmt_price(entry)), ("Last Price", fmt_price(exit_price)),
+            ("Duration", fmt_duration(duration_s))]
+    y0 = 0.33
+    for label, val in rows:
+        ax.text(0.05, y0, label, fontsize=13, color="#9aa0a6", va="center", ha="left",
+                transform=ax.transAxes, zorder=5)
+        ax.text(0.33, y0, val, fontsize=15, fontweight="bold", color="white", va="center", ha="left",
+                transform=ax.transAxes, zorder=5)
+        y0 -= 0.095
+
+    # --- right side: generic Binance-style gold mark (not the official logo) ---
+    gold = "#f0b90b"
+    ax.add_patch(RegularPolygon((0.82, 0.52), numVertices=4, radius=0.11, orientation=0.785398,
+                                 facecolor="none", edgecolor=gold, linewidth=3, alpha=0.9,
+                                 transform=ax.transAxes, zorder=3))
+    ax.text(0.82, 0.52, "B", fontsize=42, fontweight="bold", color=gold, ha="center", va="center",
+            transform=ax.transAxes, zorder=4)
+    ax.text(0.82, 0.30, "Binance Futures", fontsize=10.5, color=gold, alpha=0.85, ha="center", va="center",
+            transform=ax.transAxes, zorder=4)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.savefig(CHART_FILE, facecolor="#0b0e11")
+    plt.close(fig)
+    return CHART_FILE
+
+
 def make_tip_card(label, color, body_text):
     return _text_card(label, body_text, color)
 
@@ -2102,26 +2194,30 @@ def check_open_signals(data):
                     f"<b>🎯 TP1 HIT — {name} {s['side']}</b> <i>({strat})</i>\n\n"
                     f"Move SL to <b>entry ({fmt_price(s['entry'])})</b> now. Risk-free trade! 🛡️"
                 )
-                img = _text_card("TP1 Hit", f"{name} {s['side']} target 1 reached", "#15803d", wrap=36, badge="win")
+                duration = time.time() - s["time"] / 1000
+                img = make_profit_card(s["symbol"], s["side"], s["entry"], s["tp1"], duration)
                 send_telegram_photo(img, text, reply_to_message_id=s.get("message_id"))
             still_open.append(s)
         else:
+            profit_exit = None  # set hoga tabhi jab is close par asal profit dikhana ho (TP-style card)
             if state == "sl":
                 data["stats"]["losses"] += 1
                 header, color, badge = "Stop Loss Hit", "#7f1d1d", "loss"
                 text = f"<b>❌ {header} — {name} {s['side']}</b> <i>({strat})</i>"
             elif state == "tp2":
                 data["stats"]["wins"] += 1
-                header, color, badge = "TP2 Hit - Full Target", "#166534", "win"
+                header = "TP2 Hit - Full Target"
                 text = f"<b>🏆 {header} — {name} {s['side']}</b> <i>({strat})</i> ✅✅"
+                profit_exit = s["tp2"]
             elif state == "be":
                 data["stats"]["wins"] += 1
                 header, color, badge = "Closed at Breakeven", "#14532d", "win"
                 text = f"<b>✅ {header} — {name} {s['side']}</b> <i>({strat})</i>\nTP1 was reached, then closed at entry."
             elif state == "tp1_close":
                 data["stats"]["wins"] += 1
-                header, color, badge = "Closed after TP1", "#166534", "win"
+                header = "Closed after TP1"
                 text = f"<b>✅ {header} — {name} {s['side']}</b> <i>({strat})</i>\nClosed on time-out."
+                profit_exit = s["tp1"]
             else:  # expired
                 data["stats"]["expired"] += 1
                 header, color, badge = "Signal Expired", "#334155", "neutral"
@@ -2134,7 +2230,11 @@ def check_open_signals(data):
             })
             data["history"] = data["history"][-1000:]
             full_text = text + "\n\n" + stats_line(data["stats"])
-            img = _text_card(header, f"{name} {s['side']}", color, wrap=36, badge=badge)
+            if profit_exit is not None:
+                duration = time.time() - s["time"] / 1000
+                img = make_profit_card(s["symbol"], s["side"], s["entry"], profit_exit, duration)
+            else:
+                img = _text_card(header, f"{name} {s['side']}", color, wrap=36, badge=badge)
             send_telegram_photo(img, full_text, reply_to_message_id=s.get("message_id"))
         time.sleep(0.2)
     data["open"] = still_open
