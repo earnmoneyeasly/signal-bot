@@ -27,7 +27,7 @@ import random
 import traceback
 from collections import Counter
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
@@ -2084,6 +2084,97 @@ def post_gainers_losers():
         log(f"Gainers/losers error: {e}")
 
 
+# ============================================================
+#  CPI (US Inflation Data) CALENDAR + MARKET REACTION TRACKER
+#  Dates BLS (bls.gov/schedule/news_release/cpi.htm) ki official confirmed schedule se hain.
+#  BLS 2027 ki schedule abhi tak publish nahi ki (aam tor par fall mein publish hoti hai),
+#  is liye ye list 2026 ke aakhir tak hi hai — naya saal aane par isay update karna hoga.
+# ============================================================
+CPI_SCHEDULE_UTC = [
+    ("2026-10-14 12:30", "September 2026 CPI"),
+    ("2026-11-10 13:30", "October 2026 CPI"),
+    ("2026-12-10 13:30", "November 2026 CPI"),
+]
+
+
+def get_btc_price():
+    r = api_get("/api/v3/ticker/price", {"symbol": "BTCUSDT"})
+    return float(r["price"])
+
+
+def send_cpi_reminder(label, rel_dt):
+    pkt = rel_dt + timedelta(hours=5)  # Pakistan Standard Time, UTC+5
+    text = (
+        f"<b>📅 Upcoming CPI Release — {label}</b>\n\n"
+        f"🕒 {rel_dt.strftime('%A, %d %B %Y, %H:%M')} UTC "
+        f"(≈ {pkt.strftime('%H:%M')} Pakistan Time)\n\n"
+        "The US Consumer Price Index (CPI) measures inflation. Markets — including crypto — "
+        "often move sharply right after this number drops:\n\n"
+        "📈 Higher-than-expected CPI → inflation fears, rate-cut hopes fade → usually "
+        "<b>bearish</b> for BTC (risk-off)\n"
+        "📉 Lower-than-expected CPI → rate-cut hopes rise → usually <b>bullish</b> for BTC (risk-on)\n\n"
+        "⚠️ This isn't guaranteed — volatility can spike in either direction. Keep position sizes "
+        "small around this time."
+    )
+    send_telegram(text)
+
+
+def send_cpi_reaction(label, before, after, pct):
+    if pct > 0.3:
+        verdict = "🟢 Bullish reaction"
+    elif pct < -0.3:
+        verdict = "🔴 Bearish reaction"
+    else:
+        verdict = "⚪ Flat / Neutral reaction"
+    text = (
+        f"<b>📊 Market Reaction — {label}</b>\n\n"
+        f"BTC price just before release: {fmt_price(before)}\n"
+        f"BTC price ~1h after release: {fmt_price(after)}\n"
+        f"Change: <b>{pct:+.2f}%</b>\n\n"
+        f"Verdict: <b>{verdict}</b>\n\n"
+        "<i>Not financial advice — short-term reaction isn't always the final trend.</i>"
+    )
+    send_telegram(text)
+
+
+def check_cpi_events(data):
+    """Har run (~15 min) mein check karta hai: CPI release qareeb hai to reminder,
+    release guzar chuki ho to market ka reaction (Bullish/Bearish) report karta hai."""
+    try:
+        now = datetime.now(timezone.utc)
+        state = data.setdefault("cpi", {})
+        for date_str, label in CPI_SCHEDULE_UTC:
+            rel_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            info = state.setdefault(label, {"reminded": False, "price_before": None, "reported": False})
+            delta_to_release = (rel_dt - now).total_seconds()
+            since_release = (now - rel_dt).total_seconds()
+
+            # 1) 24 ghante pehle reminder (sirf ek baar)
+            if 0 < delta_to_release <= 24 * 3600 and not info["reminded"]:
+                send_cpi_reminder(label, rel_dt)
+                info["reminded"] = True
+
+            # 2) Release se thori der pehle BTC price snapshot le lo (comparison ke liye)
+            if 0 < delta_to_release <= 20 * 60 and info["price_before"] is None:
+                try:
+                    info["price_before"] = get_btc_price()
+                except Exception as e:
+                    log(f"CPI price snapshot error: {e}")
+
+            # 3) Release ke ~1-3 ghante baad market ka reaction report karo
+            if (info["price_before"] is not None and not info["reported"]
+                    and 60 * 60 <= since_release <= 180 * 60):
+                try:
+                    price_now = get_btc_price()
+                    pct = (price_now - info["price_before"]) / info["price_before"] * 100
+                    send_cpi_reaction(label, info["price_before"], price_now, pct)
+                    info["reported"] = True
+                except Exception as e:
+                    log(f"CPI reaction error: {e}")
+    except Exception as e:
+        log(f"CPI events error: {e}")
+
+
 def check_new_listings(data):
     """Har run mein Binance par nayi USDT listing check karta hai."""
     try:
@@ -2423,6 +2514,10 @@ def run_once(force=False):
         check_new_listings(data)
     except Exception as e:
         log(f"New listing outer error: {e}")
+    try:
+        check_cpi_events(data)
+    except Exception as e:
+        log(f"CPI outer error: {e}")
     # 15M/5M strategy ke liye har run (~15 min) scan hota hai (minimum 10 min gap)
     if force or time.time() - data.get("last_scan_time", 0) >= 600:
         scan_for_signals(data)
