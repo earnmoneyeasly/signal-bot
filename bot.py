@@ -456,6 +456,31 @@ def trend_of(df4):
     return None
 
 
+_TREND_CACHE = {}  # ek scan ke doran coin ka 4H trend sirf ek baar nikalta hai (saari strategies isay share karti hain)
+
+
+def get_coin_trend(symbol):
+    """Coin ka apna 4H trend (LONG/SHORT/None). Har 'B'-'F' strategy ye check karti hai taake
+    bare trend ke khilaf (counter-trend) signal na jaye — short-timeframe strategies ko akele
+    chhorne par wo bare downtrend mein bhi LONG de deti thin, jo aksar haar jati thin."""
+    if symbol in _TREND_CACHE:
+        return _TREND_CACHE[symbol]
+    try:
+        df4 = get_klines(symbol, "4h", 300).iloc[:-1]
+        t = trend_of(df4)
+    except Exception:
+        t = None
+    _TREND_CACHE[symbol] = t
+    return t
+
+
+def trend_aligned(symbol, side):
+    """True agar coin ka 4H trend signal ki side se match kare. Trend pata na chale (None)
+    to bhi reject karta hai — 'maloom nahi' ko 'theek hai' maan kar risk lena theek nahi."""
+    coin_trend = get_coin_trend(symbol)
+    return coin_trend == side
+
+
 # ============================================================
 #  ADVANCED SMC ENGINE
 #  Regime -> Multi-timeframe -> Liquidity -> Smart-money price action
@@ -1012,8 +1037,7 @@ def analyze_basic(symbol):
     """Fallback: simple 4H trend + 1H momentum/volume signal, jab advanced SMC ko kuch na mile.
     Grade 'BASIC' — kam sakht, jaldi signals deta hai (LONG aur SHORT dono, coin ke apne trend par)."""
     try:
-        df4 = get_klines(symbol, "4h", 300).iloc[:-1]
-        side = trend_of(df4)
+        side = get_coin_trend(symbol)
         if side is None:
             return None
         df1h = get_klines(symbol, "1h", 300).iloc[:-1]
@@ -1056,6 +1080,55 @@ def analyze_basic(symbol):
         return None
 
 
+def analyze_breakout(symbol):
+    """Strategy C: 15M range breakout + volume spike. Sab se zyada signal-frequency wali strategy,
+    kam sakht — isi liye bare 4H trend ke sath hi chalti hai (counter-trend breakouts aksar fail hotay hain)."""
+    try:
+        df15 = get_klines(symbol, "15m", 120).iloc[:-1]
+        if len(df15) < 40:
+            return None
+        window = df15.iloc[-21:-1]
+        recent_high, recent_low = float(window["high"].max()), float(window["low"].min())
+        last = df15.iloc[-1]
+        avg_vol = df15["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(last["volume"] / avg_vol) if avg_vol else 0
+        a15 = atr(df15)
+        a_now = float(a15.iloc[-1])
+        price = float(last["close"])
+        if a_now / price * 100 < MIN_ATR_PCT:
+            return None
+        if vol_ratio < VOL_MULT:
+            return None
+        if last["close"] > recent_high and last["close"] > last["open"]:
+            side = "LONG"
+        elif last["close"] < recent_low and last["close"] < last["open"]:
+            side = "SHORT"
+        else:
+            return None
+
+        if not trend_aligned(symbol, side):
+            return None  # breakout bare 4H trend ke khilaf hai — skip
+
+        risk = 1.3 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
+        else:
+            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
+        score = 50 + min(20, vol_ratio * 6)
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": int(score), "rank": score, "grade": "BREAKOUT", "strategy": "C",
+            "tags": ["displacement", "volume_confirm"],
+            "regime": "bull" if side == "LONG" else "bear",
+            "steps": ["15M Range Break", "Volume Spike"],
+            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_breakout error {symbol}: {e}")
+        return None
+
+
 def analyze_d(symbol):
     """Strategy D: classic technical analysis.
     - 4-EMA stack (9/13/21/55) = bullish/bearish bias
@@ -1080,6 +1153,9 @@ def analyze_d(symbol):
             side = "SHORT"
         else:
             return None  # EMAs tangled = no clear bias
+
+        if not trend_aligned(symbol, side):
+            return None  # 1H EMA stack bare 4H trend ke khilaf hai — counter-trend signal skip
 
         # 2) 4-EMA (10/50/100/200) as support/resistance confluence
         sr_emas = [ema(c, n).iloc[-1] for n in (10, 50, 100, 200)]
@@ -1183,6 +1259,9 @@ def analyze_e(symbol):
             return None  # koi taaza cross nahi hua
         side = "LONG" if crossed_up else "SHORT"
 
+        if not trend_aligned(symbol, side):
+            return None  # 1m cross bare 4H trend ke khilaf hai — counter-trend signal skip
+
         price = float(c.iloc[-1])
         a = atr(df)
         a_now = float(a.iloc[-1])
@@ -1218,58 +1297,6 @@ def analyze_e(symbol):
 def analyze_f(symbol):
     """Strategy F: 15-minute chart, EMA 55 vs EMA 300 crossover.
     EMA55 upar EMA300 se -> Bullish (LONG). EMA55 neeche EMA300 se -> Bearish (SHORT).
-    Sirf taaza cross (pichle ~90 minute mein) par signal deta hai, state par nahi."""
-    try:
-        df = get_klines(symbol, "15m", 500).iloc[:-1]
-        if len(df) < 320:
-            return None
-        c = df["close"]
-        e55 = ema(c, 55)
-        e300 = ema(c, 300)
-        diff = e55 - e300
-        last_diff = float(diff.iloc[-1])
-        prev_diff = float(diff.iloc[-6])  # ~90 minute pehle
-
-        crossed_up = prev_diff <= 0 and last_diff > 0
-        crossed_down = prev_diff >= 0 and last_diff < 0
-        if not (crossed_up or crossed_down):
-            return None
-        side = "LONG" if crossed_up else "SHORT"
-
-        price = float(c.iloc[-1])
-        a = atr(df)
-        a_now = float(a.iloc[-1])
-        if a_now <= 0 or a_now / price * 100 < MIN_ATR_PCT:
-            return None
-
-        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
-        vol_ratio = float(df["volume"].iloc[-1] / avg_vol) if avg_vol else 0
-
-        risk = 1.5 * a_now
-        if side == "LONG":
-            sl, tp1, tp2 = price - risk, price + TP1_RR * risk, price + TP2_RR * risk
-        else:
-            sl, tp1, tp2 = price + risk, price - TP1_RR * risk, price - TP2_RR * risk
-
-        gap_strength = min(15, abs(last_diff) / price * 100 * 30)
-        score = 50 + (15 if vol_ratio >= 1.3 else 0) + gap_strength
-
-        return {
-            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "score": int(min(score, 85)), "rank": score, "grade": "EMA CROSS 15M", "strategy": "F",
-            "tags": ["momentum", "volume_confirm"], "regime": "bull" if side == "LONG" else "bear",
-            "steps": [f"EMA55 crossed {'above' if side == 'LONG' else 'below'} EMA300 (15m)"],
-            "rr1": TP1_RR, "rr2": TP2_RR, "btc": "n/a", "funding": None, "adx": 0,
-            "time": int(time.time() * 1000),
-        }
-    except Exception as e:
-        log(f"analyze_f error {symbol}: {e}")
-        return None
-
-
-def analyze_f(symbol):
-    """Strategy F: 15-minute chart, EMA 55 vs EMA 300 crossover.
-    EMA55 upar EMA300 se -> Bullish (LONG). EMA55 neeche EMA300 se -> Bearish (SHORT).
     Sirf taaza cross (last ~75 minutes) par signal, warna hamesha ek hi state baar baar nahi aati."""
     try:
         df = get_klines(symbol, "15m", 400).iloc[:-1]
@@ -1287,6 +1314,9 @@ def analyze_f(symbol):
         if not (crossed_up or crossed_down):
             return None
         side = "LONG" if crossed_up else "SHORT"
+
+        if not trend_aligned(symbol, side):
+            return None  # 15m cross bare 4H trend ke khilaf hai — counter-trend signal skip
 
         price = float(c.iloc[-1])
         a = atr(df)
@@ -2289,6 +2319,7 @@ def scan_for_signals(data):
     """Multi-strategy scan: har coin par registered saari strategies chalti hain.
     Jo bhi strategy signal de, wo post hoti hai — 1 strategy bole to 1 post, 2 bolein to 2 post, waghera."""
     REJECTS.clear()
+    _TREND_CACHE.clear()
     _FUT["ok"] = True
     allowed, reason, min_score = protection_state(data)
     if not allowed:
