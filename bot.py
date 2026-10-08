@@ -1349,6 +1349,108 @@ def analyze_f(symbol):
         return None
 
 
+def analyze_g(symbol):
+    """Strategy G: Trend Continuation (Model B) — HTF bias + Discount/Premium pullback + LTF BOS
+    + FVG/OB retest + volume. Strategy A se asal farq: isay liquidity SWEEP ki zaroorat nahi,
+    is liye wo clean trend-continuation setups bhi pakarti hai jo A (jo hamesha sweep maangti hai)
+    reject kar deti hai. Confluence checklist se 0-100 score, kam az kam 4/5 items chahiye."""
+    try:
+        side = get_coin_trend(symbol)  # 4H HTF bias
+        if side is None:
+            return None
+        df1d = get_klines(symbol, "1d", 120).iloc[:-1]
+        b1d = day_bias(df1d)
+        if b1d is not None and b1d != side:
+            return None  # 1D HTF bias 4H ke khilaf hai
+
+        df1h = get_klines(symbol, "1h", 300).iloc[:-1]
+        if len(df1h) < 60:
+            return None
+        window = df1h.tail(60)
+        range_high, range_low = float(window["high"].max()), float(window["low"].min())
+        mid = (range_high + range_low) / 2
+        price1h = float(df1h["close"].iloc[-1])
+        if side == "LONG" and price1h >= mid:
+            return None  # discount mein nahi hai
+        if side == "SHORT" and price1h <= mid:
+            return None  # premium mein nahi hai
+
+        df15 = get_klines(symbol, "15m", 200).iloc[:-1]
+        if len(df15) < 60:
+            return None
+        sh, sl_pts = find_swings(df15)
+        if not sh or not sl_pts:
+            return None
+        price = float(df15["close"].iloc[-1])
+        a_now = float(atr(df15).iloc[-1])
+        if a_now / price * 100 < MIN_ATR_PCT:
+            return None
+
+        # BOS = push ne purani swing level todi ho, aur pullback ke baad bhi price us broken
+        # level se upar/neeche rahe (sirf apne hi taaza peak/trough se compare karna ghalat hai)
+        if side == "LONG":
+            if len(sh) < 2:
+                return None
+            broken_level = sh[-2][1]
+            bos = sh[-1][1] > broken_level and price > broken_level
+        else:
+            if len(sl_pts) < 2:
+                return None
+            broken_level = sl_pts[-2][1]
+            bos = sl_pts[-1][1] < broken_level and price < broken_level
+        if not bos:
+            return None  # LTF BOS continuation direction mein nahi hui
+
+        highs, lows = df15["high"].values, df15["low"].values
+        n = len(df15)
+        zone = None
+        for k in range(n - 3, max(n - 18, 1), -1):
+            if side == "LONG" and lows[k + 1] > highs[k - 1]:
+                zone = (highs[k - 1], lows[k + 1])
+                break
+            if side == "SHORT" and highs[k + 1] < lows[k - 1]:
+                zone = (highs[k + 1], lows[k - 1])
+                break
+        zone_touched = False
+        if zone:
+            lo, hi = min(zone), max(zone)
+            zone_touched = (lo - a_now * 0.5) <= price <= (hi + a_now * 0.5)
+
+        avg_vol = df15["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = float(df15["volume"].iloc[-1] / avg_vol) if avg_vol else 0
+
+        checklist = {
+            "HTF bias aligned": True,
+            "Discount/Premium alignment": True,
+            "LTF BOS": bos,
+            "FVG/OB entry": bool(zone_touched),
+            "Volume confirmation": vol_ratio >= VOL_MULT,
+        }
+        hits = sum(1 for v in checklist.values() if v)
+        if hits < 4:  # "confluence checklist, aim for 4+"
+            return None
+        score = int(100 * hits / len(checklist))
+
+        risk = 1.5 * a_now
+        if side == "LONG":
+            sl, tp1, tp2 = price - risk, price + 2 * risk, price + 3 * risk  # min 1:2 R:R
+        else:
+            sl, tp1, tp2 = price + risk, price - 2 * risk, price - 3 * risk
+
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": score, "rank": score, "grade": "CONTINUATION", "strategy": "G",
+            "tags": ["htf_trend", "retest", "volume_confirm"],
+            "regime": "bull" if side == "LONG" else "bear",
+            "steps": [f"{'Discount' if side == 'LONG' else 'Premium'} pullback", "LTF BOS", "FVG/OB retest"],
+            "rr1": 2.0, "rr2": 3.0, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_g error {symbol}: {e}")
+        return None
+
+
 def analyze(symbol, ctx, data, min_score, tag_stats, reg_stats):
     # ---- 1) Market regime (4H): bull/bear/sideways, trend strength, volatility ----
     df4 = get_klines(symbol, "4h", 300).iloc[:-1]
@@ -2433,6 +2535,7 @@ def scan_for_signals(data):
         ("D", lambda sym: analyze_d(sym)),
         ("E", lambda sym: analyze_e(sym)),
         ("F", lambda sym: analyze_f(sym)),
+        ("G", lambda sym: analyze_g(sym)),
     ]
     active = [(n, f) for n, f in STRATEGIES if strategy_allowed(strat_stats, n)]
     skipped = [n for n, _ in STRATEGIES if n not in dict(active)]
