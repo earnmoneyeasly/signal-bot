@@ -319,83 +319,64 @@ def fmt_duration(seconds):
     return f"{s}S"
 
 
-def make_profit_card(symbol, side, entry, exit_price, duration_s):
-    """Profit-showcase card (TP hit ke liye) — apna branding (Strexx Crypto Master) ke sath,
-    Binance ke rasmi (trademarked) logo ki jagah Binance jaisi gold/black color-scheme wala
-    generic mark istimal karta hai."""
-    name = symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
+def make_profit_card(symbol, side, entry, exit_price, duration_s=None):
+    """Profit-showcase card (TP hit ke liye) — exchange-style 'share card' look:
+    diamond-pattern watermark (generic, Binance ka rasmi trademarked logo nahi), coin name,
+    side, bara % profit, aur Entry/Last Price side-by-side. Apna branding bhi shamil hai."""
     pct = (exit_price - entry) / entry * 100
     if side == "SHORT":
         pct = -pct
-    pct_txt = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
-    pct_color = "#22c55e" if pct >= 0 else "#ef4444"
-    side_color = "#22c55e" if side == "LONG" else "#ef4444"
+    pct_txt = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+    pct_color = "#0ecb81" if pct >= 0 else "#f6465d"
+    side_color = "#0ecb81" if side == "LONG" else "#f6465d"
 
     from matplotlib.patches import FancyBboxPatch, RegularPolygon
 
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
-    fig.patch.set_facecolor("#0b0e11")
-    ax.set_facecolor("#0b0e11")
+    fig, ax = plt.subplots(figsize=(7.2, 7.2), dpi=140)  # square figure -> diamonds asli diamond shape mein bantay hain
+    fig.patch.set_facecolor("#000000")
+    ax.set_facecolor("#000000")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
 
+    # --- decorative diamond-grid watermark, top-right (generic geometric pattern, NOT the
+    #     official Binance logo — just an abstract tile motif in the same visual spirit) ---
+    positions = [(0.70, 1.05), (0.90, 1.05), (0.60, 0.90), (0.80, 0.90), (1.00, 0.90),
+                 (0.70, 0.75), (0.90, 0.75), (0.80, 0.60), (0.60, 0.60), (1.00, 0.60)]
+    for (dx, dy) in positions:
+        ax.add_patch(RegularPolygon((dx, dy), numVertices=4, radius=0.10, orientation=0,
+                                     facecolor="#1b1b1b", edgecolor="#000000", linewidth=2.5, alpha=1,
+                                     transform=ax.transAxes, zorder=1))
+
     # --- top-left branding: Strexx Crypto Master ---
-    ax.add_patch(FancyBboxPatch((0.045, 0.885), 0.045, 0.06, boxstyle="round,pad=0.006,rounding_size=0.02",
-                                 linewidth=0, facecolor="#22c55e", transform=ax.transAxes, zorder=5))
-    ax.text(0.105, 0.915, "Strexx Crypto Master", fontsize=15, fontweight="bold", color="white",
+    ax.add_patch(FancyBboxPatch((0.06, 0.90), 0.036, 0.03, boxstyle="round,pad=0.004,rounding_size=0.01",
+                                 linewidth=0, facecolor="#0ecb81", transform=ax.transAxes, zorder=5))
+    ax.text(0.108, 0.915, "Strexx Crypto Master", fontsize=13, fontweight="bold", color="white",
             va="center", ha="left", transform=ax.transAxes, zorder=5)
 
-    # --- symbol | side badge (exact width renderer se naapi jati hai, taake overlap na ho) ---
-    name_txt = ax.text(0.05, 0.775, name, fontsize=22, fontweight="bold", color="white",
-                        va="center", ha="left", transform=ax.transAxes, zorder=5)
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    inv = ax.transAxes.inverted()
-    name_end_x = name_txt.get_window_extent(renderer=renderer).transformed(inv).x1
+    # --- "{SYMBOL} Perpetual" title ---
+    ax.text(0.06, 0.775, f"{symbol} Perpetual", fontsize=25, fontweight="bold", color="white",
+            va="center", ha="left", transform=ax.transAxes, zorder=5)
 
-    side_label = side.capitalize()
-    badge_x = name_end_x + 0.035
-    side_txt = ax.text(0, 0, side_label, fontsize=16, fontweight="bold", color=side_color, alpha=0)
-    fig.canvas.draw()
-    side_w = side_txt.get_window_extent(renderer=renderer).transformed(inv).width
-    side_txt.remove()
-    pad = 0.018
-    badge_w = side_w + 2 * pad
-    ax.add_patch(FancyBboxPatch((badge_x, 0.745), badge_w, 0.065, boxstyle="round,pad=0.004,rounding_size=0.018",
-                                 linewidth=1.3, edgecolor=side_color, facecolor=side_color, alpha=0.18,
-                                 transform=ax.transAxes, zorder=4))
-    ax.text(badge_x + badge_w / 2, 0.778, side_label, fontsize=16, fontweight="bold", color=side_color,
-            va="center", ha="center", transform=ax.transAxes, zorder=5)
+    # --- side (Long/Short) ---
+    ax.text(0.062, 0.70, side.capitalize(), fontsize=15, fontweight="bold", color=side_color,
+            va="center", ha="left", transform=ax.transAxes, zorder=5)
 
     # --- big profit percentage ---
-    ax.text(0.05, 0.56, pct_txt, fontsize=50, fontweight="bold", color=pct_color,
+    ax.text(0.06, 0.555, pct_txt, fontsize=58, fontweight="bold", color=pct_color,
             va="center", ha="left", transform=ax.transAxes, zorder=5)
 
-    # --- entry / last price / duration rows ---
-    rows = [("Entry Price", fmt_price(entry)), ("Last Price", fmt_price(exit_price)),
-            ("Duration", fmt_duration(duration_s))]
-    y0 = 0.33
-    for label, val in rows:
-        ax.text(0.05, y0, label, fontsize=13, color="#9aa0a6", va="center", ha="left",
+    # --- Entry Price / Last Price, side-by-side columns ---
+    cols = [("Entry Price", fmt_price(entry), 0.06), ("Last Price", fmt_price(exit_price), 0.52)]
+    for label, val, x in cols:
+        ax.text(x, 0.40, label, fontsize=14, color="#848e9c", va="center", ha="left",
                 transform=ax.transAxes, zorder=5)
-        ax.text(0.33, y0, val, fontsize=15, fontweight="bold", color="white", va="center", ha="left",
+        ax.text(x, 0.345, val, fontsize=19, fontweight="bold", color="white", va="center", ha="left",
                 transform=ax.transAxes, zorder=5)
-        y0 -= 0.095
-
-    # --- right side: generic Binance-style gold mark (not the official logo) ---
-    gold = "#f0b90b"
-    ax.add_patch(RegularPolygon((0.82, 0.52), numVertices=4, radius=0.11, orientation=0.785398,
-                                 facecolor="none", edgecolor=gold, linewidth=3, alpha=0.9,
-                                 transform=ax.transAxes, zorder=3))
-    ax.text(0.82, 0.52, "B", fontsize=42, fontweight="bold", color=gold, ha="center", va="center",
-            transform=ax.transAxes, zorder=4)
-    ax.text(0.82, 0.30, "Binance Futures", fontsize=10.5, color=gold, alpha=0.85, ha="center", va="center",
-            transform=ax.transAxes, zorder=4)
 
     for spine in ax.spines.values():
         spine.set_visible(False)
-    fig.savefig(CHART_FILE, facecolor="#0b0e11")
+    fig.savefig(CHART_FILE, facecolor="#000000")
     plt.close(fig)
     return CHART_FILE
 
@@ -1448,6 +1429,108 @@ def analyze_g(symbol):
         }
     except Exception as e:
         log(f"analyze_g error {symbol}: {e}")
+        return None
+
+
+LONDON_OPEN_UTC = (7, 0)    # London session open (approx)
+NY_OPEN_UTC = (13, 30)      # New York session open (approx)
+ORB_RANGE_MIN = 30          # opening range ki lambai (minutes)
+ORB_VALID_FROM = 30         # range banne ke kitni der baad se setup valid hai
+ORB_VALID_UNTIL = 180       # kitni der tak valid rehta hai
+
+
+def session_opens(now_utc):
+    d = now_utc.date()
+    lon = datetime(d.year, d.month, d.day, LONDON_OPEN_UTC[0], LONDON_OPEN_UTC[1], tzinfo=timezone.utc)
+    ny = datetime(d.year, d.month, d.day, NY_OPEN_UTC[0], NY_OPEN_UTC[1], tzinfo=timezone.utc)
+    return [(lon, "London"), (ny, "New York")]
+
+
+def analyze_h(symbol):
+    """Strategy H: Opening Range Break & Retest (Model C) — London/NY session open ki pehli
+    30 minute ki range, phir uska break aur retest. Ye A/B/G se mukhtalif hai kyunke ye sirf
+    din ke mukhtalif waqt (session opens) mein hi active hoti hai, warna kuch nahi karti."""
+    try:
+        now = datetime.now(timezone.utc)
+        active = None
+        for open_dt, label in session_opens(now):
+            mins_since_open = (now - open_dt).total_seconds() / 60
+            if ORB_VALID_FROM <= mins_since_open <= ORB_VALID_UNTIL:
+                active = (open_dt, label)
+                break
+        if active is None:
+            return None  # abhi koi session-open window active nahi hai
+        open_dt, label = active
+
+        df15 = get_klines(symbol, "15m", 40).iloc[:-1]
+        if len(df15) < 20:
+            return None
+        df15 = df15.copy()
+        df15["dt"] = pd.to_datetime(df15["open_time"], unit="ms", utc=True)
+
+        or_candles = df15[(df15["dt"] >= open_dt) & (df15["dt"] < open_dt + timedelta(minutes=ORB_RANGE_MIN))]
+        if len(or_candles) < 1:
+            return None
+        or_high = float(or_candles["high"].max())
+        or_low = float(or_candles["low"].min())
+        or_range = or_high - or_low
+        if or_range <= 0:
+            return None
+
+        after = df15[df15["dt"] >= open_dt + timedelta(minutes=ORB_RANGE_MIN)]
+        if len(after) < 2:
+            return None
+        price = float(df15["close"].iloc[-1])
+        a_now = float(atr(df15).iloc[-1])
+        if a_now / price * 100 < MIN_ATR_PCT:
+            return None
+
+        broke_up = bool((after["close"] > or_high).any())
+        broke_down = bool((after["close"] < or_low).any())
+        if broke_up and not broke_down:
+            side, level = "LONG", or_high
+        elif broke_down and not broke_up:
+            side, level = "SHORT", or_low
+        else:
+            return None  # dono taraf break hui ya koi clear break nahi hui
+
+        last_open, last_close = float(df15["open"].iloc[-1]), float(df15["close"].iloc[-1])
+        if side == "LONG":
+            retested = (price >= level - a_now * 0.6) and (last_close > last_open)
+        else:
+            retested = (price <= level + a_now * 0.6) and (last_close < last_open)
+        if not retested:
+            return None  # broken level ka retest nahi hua abhi
+
+        htf_ok = get_coin_trend(symbol) == side
+        avg_vol = df15["volume"].rolling(10).mean().iloc[-1]
+        vol_ratio = float(df15["volume"].iloc[-1] / avg_vol) if avg_vol else 0
+
+        checklist = {"ORB break+retest": True, "HTF bias aligned": htf_ok, "Volume healthy": vol_ratio >= 1.0}
+        hits = sum(1 for v in checklist.values() if v)
+        if hits < 2:
+            return None
+        score = 45 + int(55 * hits / len(checklist))
+
+        if side == "LONG":
+            sl, tp1, tp2 = or_low, price + or_range, price + 2 * or_range
+            if sl >= price:
+                return None
+        else:
+            sl, tp1, tp2 = or_high, price - or_range, price - 2 * or_range
+            if sl <= price:
+                return None
+
+        return {
+            "symbol": symbol, "side": side, "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": score, "rank": score, "grade": "ORB SCALP", "strategy": "H",
+            "tags": ["retest", "volume_confirm"], "regime": "bull" if side == "LONG" else "bear",
+            "steps": [f"{label} Opening Range Break", "Retest", "Confirmation"],
+            "rr1": 1.5, "rr2": 3.0, "btc": "n/a", "funding": None, "adx": 0,
+            "time": int(time.time() * 1000),
+        }
+    except Exception as e:
+        log(f"analyze_h error {symbol}: {e}")
         return None
 
 
@@ -2536,6 +2619,7 @@ def scan_for_signals(data):
         ("E", lambda sym: analyze_e(sym)),
         ("F", lambda sym: analyze_f(sym)),
         ("G", lambda sym: analyze_g(sym)),
+        ("H", lambda sym: analyze_h(sym)),
     ]
     active = [(n, f) for n, f in STRATEGIES if strategy_allowed(strat_stats, n)]
     skipped = [n for n, _ in STRATEGIES if n not in dict(active)]
