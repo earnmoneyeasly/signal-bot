@@ -378,6 +378,13 @@ def make_profit_card(symbol, side, entry, exit_price, duration_s=None):
         spine.set_visible(False)
     fig.savefig(CHART_FILE, facecolor="#000000")
     plt.close(fig)
+
+    # Square figure sirf diamonds ko sahi shape dene ke liye thi — ab neeche ki khali
+    # jagah crop kar dete hain taake final card bohat lamba na lage.
+    from PIL import Image
+    img = Image.open(CHART_FILE)
+    w, h = img.size
+    img.crop((0, 0, w, int(h * 0.70))).save(CHART_FILE)
     return CHART_FILE
 
 
